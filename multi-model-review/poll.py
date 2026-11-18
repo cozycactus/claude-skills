@@ -51,13 +51,15 @@ BILLING = {"codex": "ChatGPT plan", "grok": "Cursor plan", "deepseek": "per toke
 CODEX_MODEL = "gpt-6.2-sol"
 CODEX_EFFORT = "max"
 DEEPSEEK_MODEL = "deepseek/deepseek-flash#max"
-GROK_MODEL = "grok-4.7-high"
-GEMINI_MODEL = "gemini-4-carbon"
+GROK_MODEL = "grok-4.7-xhigh"
+GEMINI_MODEL = "gemini-4-hydrogen"
 
 # USD per 1M tokens: (first day, input, output). Cached input costs 5% of input.
-# Source: https://aistudio.google.com/learn/gemini-4-carbon-developer-guide,
-# read 2026-11-11. No long-context tier or cache-write price is modelled.
+# Sources: https://aistudio.google.com/learn/gemini-4-carbon-developer-guide, read 2026-11-11;
+# Hydrogen ($1.50 / $7.50, flat to 1M tokens, launched 2026-11-12) from published price
+# summaries read 2026-11-18. No long-context tier or cache-write price is modelled.
 GEMINI_PRICES = {
+    "gemini-4-hydrogen": [("0000-00-00", 1.5, 7.5)],
     "gemini-4-carbon": [("0000-00-00", 2.0, 10.0), ("2026-12-01", 4.0, 20.0)],
     "gemini-4-argon": [("0000-00-00", 2.0, 10.0), ("2026-12-01", 4.0, 20.0)],
 }
