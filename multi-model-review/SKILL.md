@@ -1,6 +1,6 @@
 ---
 name: multi-model-review
-description: Independent poll of Codex Sol, DeepSeek, Gemini and Grok for architecture decisions, review of specs, plans and important code, and hard bugs
+description: Independent poll of Codex Astra, DeepSeek, Gemini and Grok for architecture decisions, review of specs, plans and important code, and hard bugs
 ---
 
 # Polling several models

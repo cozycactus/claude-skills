@@ -48,7 +48,7 @@ ALL_MODELS = ["codex", "deepseek", "grok", "gemini"]
 CAN_RUN = {"codex", "gemini"}
 BILLING = {"codex": "ChatGPT plan", "grok": "Cursor plan", "deepseek": "per token", "gemini": "per token"}
 
-CODEX_MODEL = "gpt-6.2-sol"
+CODEX_MODEL = "gpt-6.2-astra"
 CODEX_EFFORT = "max"
 DEEPSEEK_MODEL = "deepseek/deepseek-flash#max"
 GROK_MODEL = "grok-4.7-xhigh"
