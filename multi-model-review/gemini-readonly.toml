@@ -1,0 +1,22 @@
+# Policy for a read-only Gemini review, passed with --policy by poll.py.
+# Everything is denied except a short list of read tools. Without a policy a
+# headless `--approval-mode plan` run can call exit_plan_mode, which Gemini CLI
+# auto-approves and then switches to yolo (seen 2026-11-11, Gemini CLI 0.68.0:
+# the model then created a file and ran a shell command).
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 998
+denyMessage = "This is a read-only review: only read and search tools are available. Give the answer as your final message."
+
+[[rule]]
+toolName = "*"
+mcpName = "*"
+decision = "deny"
+priority = 998
+denyMessage = "This is a read-only review: MCP tools are not available."
+
+[[rule]]
+toolName = ["read_file", "list_directory", "glob", "grep_search", "google_web_search", "update_topic"]
+decision = "allow"
+priority = 999
