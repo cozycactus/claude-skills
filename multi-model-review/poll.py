@@ -597,6 +597,11 @@ def child_env(model, d=None, own_data=False):
                        XDG_CACHE_HOME=os.path.join(base, "cache"))
     if model in PRIVATE_HOME and d:
         env["HOME"] = os.path.join(d, "home")
+    if model == "grok" and d:
+        # cursor-agent puts its worker.sock under <data dir>/projects, or under /tmp/.cursor
+        # (denied) once that path passes 83 characters; a path relative to its working
+        # directory, the copy, keeps it in the private home however long the poll path is
+        env["CURSOR_DATA_DIR"] = os.path.join(os.pardir, "home", ".cursor")
     if model == "gemini":
         key = os.environ.get("GEMINI_API_KEY") or keychain_value(KEYCHAIN["gemini"][0])
         if not key:
