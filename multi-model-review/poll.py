@@ -62,7 +62,7 @@ DEEPSEEK_MODEL = "deepseek/deepseek-flash"      # opencode gets "<model>#<effort
 DEEPSEEK_EFFORT = "max"
 GROK_MODEL = "grok-4.7"                          # cursor-agent gets "<model>-<effort>"
 GROK_EFFORT = "xhigh"
-GEMINI_MODEL = "gemini-4-hydrogen"               # Gemini CLI 0.68 has no option for the thinking level
+GEMINI_MODEL = "gemini-4-neon"                   # Gemini CLI 0.68 has no option for the thinking level
 DEFAULTS = {"codex": (CODEX_MODEL, CODEX_EFFORT), "deepseek": (DEEPSEEK_MODEL, DEEPSEEK_EFFORT),
             "grok": (GROK_MODEL, GROK_EFFORT), "gemini": (GEMINI_MODEL, None)}
 CLI_BIN = {"codex": "codex", "deepseek": os.path.join(HOME, ".opencode", "bin", "opencode"),
@@ -79,8 +79,11 @@ SLOT_DIR_RE = re.compile(r"(%s)([_+][A-Za-z0-9._+-]*)?" % "|".join(ALL_MODELS))
 # USD per 1M tokens: (first day, input, output). Cached input costs 5% of input.
 # Sources: https://aistudio.google.com/learn/gemini-4-carbon-developer-guide, read 2026-11-11;
 # Hydrogen ($1.50 / $7.50, flat to 1M tokens, launched 2026-11-12) from published price
-# summaries read 2026-11-18. No long-context tier or cache-write price is modelled.
+# summaries read 2026-11-18; Neon ($3 / $15, cached $0.15, no long-context tier) from
+# https://aistudio.google.com/docs/pricing, read 2026-11-20.
+# No long-context tier or cache-write price is modelled.
 GEMINI_PRICES = {
+    "gemini-4-neon": [("0000-00-00", 3.0, 15.0)],
     "gemini-4-hydrogen": [("0000-00-00", 1.5, 7.5)],
     "gemini-4-carbon": [("0000-00-00", 2.0, 10.0), ("2026-12-01", 4.0, 20.0)],
     "gemini-4-argon": [("0000-00-00", 2.0, 10.0), ("2026-12-01", 4.0, 20.0)],
