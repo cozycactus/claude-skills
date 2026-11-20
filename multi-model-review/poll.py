@@ -52,9 +52,17 @@ BILLING = {"codex": "ChatGPT plan", "grok": "Cursor plan", "deepseek": "per toke
 
 CODEX_MODEL = "gpt-6.2-astra"
 CODEX_EFFORT = "max"
-DEEPSEEK_MODEL = "deepseek/deepseek-flash#max"
-GROK_MODEL = "grok-4.7-xhigh"
-GEMINI_MODEL = "gemini-4-hydrogen"
+DEEPSEEK_MODEL = "deepseek/deepseek-flash"      # opencode gets "<model>#<effort>"
+DEEPSEEK_EFFORT = "max"
+GROK_MODEL = "grok-4.7"                          # cursor-agent gets "<model>-<effort>"
+GROK_EFFORT = "xhigh"
+GEMINI_MODEL = "gemini-4-hydrogen"               # Gemini CLI 0.68 has no option for the thinking level
+DEFAULTS = {"codex": (CODEX_MODEL, CODEX_EFFORT), "deepseek": (DEEPSEEK_MODEL, DEEPSEEK_EFFORT),
+            "grok": (GROK_MODEL, GROK_EFFORT), "gemini": (GEMINI_MODEL, None)}
+CLI_BIN = {"codex": "codex", "deepseek": os.path.join(HOME, ".opencode", "bin", "opencode"),
+           "grok": "cursor-agent", "gemini": "gemini"}
+# how the effort reaches the model: a flag of its own, a suffix of the model id, or the CLI's own choice
+EFFORT_SOURCE = {"codex": "flag", "deepseek": "model-id", "grok": "model-id", "gemini": "cli-default"}
 
 # USD per 1M tokens: (first day, input, output). Cached input costs 5% of input.
 # Sources: https://aistudio.google.com/learn/gemini-4-carbon-developer-guide, read 2026-11-11;
@@ -563,25 +571,35 @@ def child_env(model, d=None, own_data=False):
     return env
 
 
+def model_arg(provider, model, effort):
+    """The model string the CLI is given: DeepSeek and Grok carry the effort inside it."""
+    if effort and provider == "deepseek":
+        return "%s#%s" % (model, effort)
+    if effort and provider == "grok":
+        return "%s-%s" % (model, effort)
+    return model
+
+
 def child_argv(model, d, pid, run, brief, policy):
     copy = os.path.join(d, "copy")
+    name, effort = DEFAULTS[model]
     if model == "codex":
-        return ["codex", "exec", "--ignore-user-config", "-m", CODEX_MODEL,
-                "-c", 'model_reasoning_effort="%s"' % CODEX_EFFORT,
+        return [CLI_BIN[model], "exec", "--ignore-user-config", "-m", name,
+                "-c", 'model_reasoning_effort="%s"' % effort,
                 # without this, workspace-write could also write anywhere under /tmp
                 "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
                 "-s", "workspace-write" if run else "read-only", "--skip-git-repo-check",
                 "-C", copy, "-o", os.path.join(d, "last.txt"), "-"]
     if model == "deepseek":
         return ["sandbox-exec", "-f", os.path.join(d, "profile.sb"),
-                os.path.join(HOME, ".opencode", "bin", "opencode"), "--standalone", "run",
-                "--format", "json", "-m", DEEPSEEK_MODEL, "--title", pid, brief]
+                CLI_BIN[model], "--standalone", "run",
+                "--format", "json", "-m", model_arg(model, name, effort), "--title", pid, brief]
     if model == "grok":
-        return ["sandbox-exec", "-f", os.path.join(d, "profile.sb"), "cursor-agent", "-p", "--trust",
-                "--mode", "ask", "--model", GROK_MODEL, "--output-format", "stream-json",
+        return ["sandbox-exec", "-f", os.path.join(d, "profile.sb"), CLI_BIN[model], "-p", "--trust",
+                "--mode", "ask", "--model", model_arg(model, name, effort), "--output-format", "stream-json",
                 "--workspace", copy, brief]
     mode = ["--approval-mode", "yolo"] if run else ["--approval-mode", "plan", "--policy", policy]
-    return ["gemini", "--skip-trust"] + mode + ["-s", "-m", GEMINI_MODEL, "-o", "stream-json", "-p", brief]
+    return [CLI_BIN[model], "--skip-trust"] + mode + ["-s", "-m", name, "-o", "stream-json", "-p", brief]
 
 
 def group_pids(pgid):
@@ -658,10 +676,10 @@ def kill_all(procs, pgid=None, patience=8, signals=(signal.SIGINT, signal.SIGTER
     return sorted(p for p, b in targets.items() if same(p, b))
 
 
-def write_json(path, obj):
-    tmp = path + ".part"
+def write_json(path, obj, indent=None):
+    tmp = "%s.%d.part" % (path, os.getpid())             # two writers never share a temporary file
     with open(tmp, "w") as f:
-        json.dump(obj, f)
+        json.dump(obj, f, indent=indent)
     os.replace(tmp, path)
 
 
@@ -698,6 +716,13 @@ def cmd_launch(a):
         env["TMPDIR"] = os.environ.get("TMPDIR") or tempfile.gettempdir()
     else:
         env["TMPDIR"] = os.path.join(d, "tmp") + os.sep
+    rec = run_base(meta, m)                              # what is known before the model starts
+    rec.update(cli_version=cli_version(CLI_BIN[m], env, os.path.join(d, "copy")), status="running",
+               started=me["started"], started_iso=iso(me["started"]))
+    try:
+        write_run(d, rec)
+    except OSError as e:                                 # a missing record must not stop the review
+        sys.stderr.write("[poll] could not write %s: %s\n" % (RUN, e))
     brief = open(os.path.join(d, "brief.txt"), encoding="utf-8").read()
     policy = None
     if m == "gemini" and not run:
@@ -730,6 +755,7 @@ def cmd_launch(a):
     except OSError as e:
         with open(os.path.join(d, "exit"), "w") as f:
             f.write("127\n")
+        finish_record(d, m)
         die("could not start %s: %s" % (argv[0], e), 127)
     result = "launcher-error"
     known = {}                                           # pid -> birth of everything the model started
@@ -821,6 +847,7 @@ def cmd_launch(a):
                 pass
         with open(os.path.join(d, "exit"), "w") as f:
             f.write(result + "\n")
+        finish_record(d, m)                              # after exit: the record reads the result from it
         sys.stderr.write("\n[poll] %s finished: %s\n" % (m, result))
     sys.exit(0 if result == "0" else 1)
 
@@ -853,11 +880,26 @@ def model_dir(root, m):
 
 
 def read(path, default=""):
+    """A text file; Codex compresses its older sessions with zstd (.zst)."""
     try:
+        if path.endswith(".zst"):
+            from compression import zstd                 # Python 3.14 and later
+            with zstd.open(path, "rt", errors="replace") as f:
+                return f.read()
         with open(path, errors="replace") as f:
             return f.read()
-    except OSError:
+    except (OSError, ImportError, EOFError, ValueError):
         return default
+
+
+def tail(path, size):
+    """The last size bytes of a file, as text."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - size))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 def events(path):
@@ -1000,6 +1042,20 @@ def final_text(model, d):
                      and e["part"].get("messageID") == mid), ""
 
 
+def take(model, d, code):
+    """(text, problem, answer, notes, kind) of an exited run; problem is "" when it gave an answer."""
+    try:
+        text, problem = final_text(model, d)
+    except Exception as e:                               # one broken log must not hide the others
+        text, problem = "", "could not read the log: %s: %s" % (type(e).__name__, e)
+    if code != "0":
+        problem = "run ended with %s%s" % (code, "; " + problem if problem else "")
+    answer, notes, kind = cut(text)
+    if not problem and not answer:
+        problem = "the final message is empty"
+    return text, problem, answer, notes, kind
+
+
 def cmd_answers(a):
     root = poll_dir(a.poll)
     meta = meta_of(root)
@@ -1012,19 +1068,12 @@ def cmd_answers(a):
                 os.remove(os.path.join(d, stale))
             except OSError:
                 pass
+        finish_record(d, m)
         st, code = state(d)
         if st != "exited":
             print("| %s | %s | | no answer taken |" % (m, st))
             continue
-        try:
-            text, problem = final_text(m, d)
-        except Exception as e:                           # one broken log must not hide the others
-            text, problem = "", "could not read the log: %s: %s" % (type(e).__name__, e)
-        if code != "0":
-            problem = "run ended with %s%s" % (code, "; " + problem if problem else "")
-        answer, notes, kind = cut(text)
-        if not problem and not answer:
-            problem = "the final message is empty"
+        text, problem, answer, notes, kind = take(m, d, code)
 
         def save(name, body):
             path = os.path.join(d, name)
@@ -1050,6 +1099,148 @@ def cmd_answers(a):
                   "answer: read it and decide |" % (m, where))
         else:
             print("| %s | ok | %s | %s |" % (m, where, note))
+
+
+# ---------------------------------------------------------------- run record
+
+RUN = "run.json"
+ANSWER_KIND = {"ok": "ok", "last": "marker_last", "none": "no_marker"}
+# Why a run that did not end cleanly failed, tried in order on the end of its stderr and the error
+# events of its log. Anchored on status words: Codex's stderr also holds the brief and whatever the
+# model printed, so a bare number would match file contents.
+FAILURES = [(c, re.compile(p, re.I)) for c, p in (
+    ("credits", r"(status|code)\W{0,5}402\b|payment required|prepay|buy credits"
+                r"|credits? (are |is )?(depleted|exhausted)|insufficient (balance|credit|funds)"),
+    ("plan_limit", r"(status|code)\W{0,5}429\b|rate.?limit|usage limit|quota|too many requests"),
+    ("credits", r"RESOURCE_EXHAUSTED"),                  # after plan_limit: Google also sends it with 429
+    ("auth", r"(status|code)\W{0,5}401\b|unauthori[sz]ed|not logged in|not signed in|invalid api key"
+             r"|authentication (failed|required|error)"),
+    ("sandbox", r"sandbox_apply|operation not permitted|\bEPERM\b"),
+    ("timeout", r"timed? ?out\b|ETIMEDOUT|deadline.exceeded"),
+)]
+
+
+def iso(t):
+    return datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds") if t else None
+
+
+def read_run(d):
+    try:
+        rec = json.loads(read(os.path.join(d, RUN)) or "null")
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def write_run(d, rec):
+    write_json(os.path.join(d, RUN), rec, indent=1)
+
+
+def cli_version(argv0, env, cwd):
+    """The first line `<cli> --version` prints, or None when it fails or takes over 10 s."""
+    with tempfile.TemporaryFile() as out:                # a file, not a pipe: a leftover child cannot hold it open
+        try:
+            p = subprocess.Popen([argv0, "--version"], env=env, cwd=cwd, stdin=subprocess.DEVNULL,
+                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError:
+            return None
+        try:
+            code = p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+            return None
+        out.seek(0)
+        lines = [l.strip() for l in ANSI_RE.sub("", out.read(4096).decode("utf-8", "replace")).splitlines() if l.strip()]
+    return lines[0][:200] if code == 0 and lines else None
+
+
+def run_base(meta, m):
+    """The part of a run record that is known before the model starts."""
+    model, effort = DEFAULTS[m]
+    return {"slot": m, "provider": m, "model": model, "effort": effort, "effort_source": EFFORT_SOURCE[m],
+            "model_arg": model_arg(m, model, effort), "cli": os.path.basename(CLI_BIN[m]), "cli_version": None,
+            "mode": "run" if m in meta.get("run", []) or m == "deepseek" else "read",
+            "poll": meta.get("id"), "poll_kind": meta.get("kind"), "inferred": False}
+
+
+def failure_text(d):
+    """Where a failed run says why: the end of its stderr and the error events of its log."""
+    parts = [ANSI_RE.sub("", tail(os.path.join(d, "err"), 3000))]
+    for e in events(os.path.join(d, "log")):
+        if (e.get("type") == "error" or e.get("is_error")
+                or e.get("type") == "result" and e.get("status") not in (None, "success")):
+            parts.append(json.dumps(e)[:2000])
+    return "\n".join(parts)
+
+
+def outcome(model, d, st, code):
+    """(status, failure category, answer kind) of a run, judged the way answers judges it."""
+    if st in ("starting", "running", "orphaned"):
+        return "running", None, None
+    if st == "not started":
+        return "not started", None, None
+    if code == "stopped":
+        return "stopped", "stopped", None
+    text, problem, kind = "", "the launcher is gone without a result", None
+    if st == "exited":
+        text, problem, _, _, kind = take(model, d, code)
+    if not problem:                                      # an answer was taken; without a marker it is suspect
+        return "finished", "no_marker" if kind == "none" else None, ANSWER_KIND[kind]
+    if code not in (None, "0") and MARKER_RE.search(text):
+        return "failed", "crashed_after_answer", None
+    if code == "policy-error":
+        return "failed", "sandbox", None
+    blob = failure_text(d)
+    return "failed", next((c for c, rx in FAILURES if rx.search(blob)), "other"), None
+
+
+def usage_figures(model, d):
+    """The usage table's figures for one run, summed over the models it used."""
+    try:
+        rows = USAGE[model](d)
+    except Exception:
+        rows = []
+    fig = {k: total(r[k] for r in rows) if rows else None for k in ("input", "cached", "output", "reasoning", "usd")}
+    fig["billing"] = BILLING[model]
+    fig["quota_pct"] = next((r["quota_pct"] for r in rows if r.get("quota_pct") is not None), None)
+    return fig
+
+
+def observe(model, d):
+    """What a model folder's files say about its run: times, result, status, failure and usage."""
+    st, code = state(d)
+    started = (pid_info(d) or {}).get("started")
+    if not started:                                      # the shell launcher of the first polls wrote this file
+        s = read(os.path.join(d, "started")).strip()
+        started = int(s) if s.isdigit() else None
+    ended = int(os.path.getmtime(os.path.join(d, "exit"))) if st == "exited" else None
+    status, failure, kind = outcome(model, d, st, code)
+    rec = {"started": started, "started_iso": iso(started), "ended": ended, "ended_iso": iso(ended),
+           "duration_s": ended - started if started and ended else None, "result": code,
+           "exit_code": int(code) if code and code.lstrip("-").isdigit() else None,
+           "status": status, "failure": failure, "answer": kind}
+    if st != "not started":
+        rec.update(usage_figures(model, d))
+    return rec
+
+
+def finish_record(d, model):
+    """Complete the record written at launch from what the run's files now say. Never raises:
+    a record is bookkeeping and must not break a launcher or answers. Polls made before run
+    records have none; backfill writes theirs."""
+    try:
+        rec = read_run(d)
+        if rec is not None:
+            rec.update(observe(rec.get("provider") or model, d))
+            write_run(d, rec)
+        return rec
+    except Exception as e:
+        sys.stderr.write("[poll] %s not completed in %s: %s: %s\n" % (RUN, d, type(e).__name__, e))
+        return None
 
 
 # ---------------------------------------------------------------- status / stop / clean
@@ -1125,6 +1316,7 @@ def cmd_stop(a):
             % (a.model, ", ".join(map(str, left))))
     with open(os.path.join(d, "exit"), "w") as f:
         f.write("stopped\n")
+    finish_record(d, a.model)
     print("%s: stopped" % a.model)
 
 
@@ -1191,9 +1383,9 @@ def total(values):
     return None if not values or any(v is None for v in values) else sum(values)
 
 
-def row(model, inp=None, cached=None, out=None, reasoning=None, usd=None, billing="", note=""):
+def row(model, inp=None, cached=None, out=None, reasoning=None, usd=None, billing="", note="", quota_pct=None):
     return {"model": model, "input": inp, "cached": cached, "output": out,
-            "reasoning": reasoning, "usd": usd, "billing": billing, "note": note}
+            "reasoning": reasoning, "usd": usd, "billing": billing, "note": note, "quota_pct": quota_pct}
 
 
 def usage_gemini(d):
@@ -1239,13 +1431,18 @@ def usage_grok(d):
                 "input is cursor-agent's own figure and may include cached tokens; reasoning is part of output")]
 
 
+def codex_sessions(sid):
+    """Codex's session files for a session id, plain or zstd-compressed."""
+    base = os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "rollout-*%s*" % sid)  # no CODEX_HOME is passed on
+    return sorted(glob.glob(base + ".jsonl") + glob.glob(base + ".jsonl.zst"))
+
+
 def usage_codex(d):
     text = read(os.path.join(d, "err")) + "\n" + read(os.path.join(d, "log"))   # codex traces on stderr
     m = re.search(r"session id:\s*([0-9a-f-]{20,})", text, re.I)
-    usage, note = None, ""
+    usage, note, pct = None, "", None
     if m:
-        home = os.path.join(HOME, ".codex")           # the launcher does not pass CODEX_HOME on
-        for f in sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "rollout-*%s*.jsonl" % m.group(1)))):
+        for f in codex_sessions(m.group(1)):
             for e in events(f):
                 p = e.get("payload") if isinstance(e.get("payload"), dict) else e
                 info = p.get("info") if isinstance(p.get("info"), dict) else None
@@ -1253,16 +1450,17 @@ def usage_codex(d):
                     usage = info["total_token_usage"]
                     lim = p.get("rate_limits") if isinstance(p.get("rate_limits"), dict) else {}
                     lim = lim.get("primary") if isinstance(lim.get("primary"), dict) else {}
-                    if lim.get("used_percent") is not None:
+                    if isinstance(lim.get("used_percent"), (int, float)):
+                        pct = lim["used_percent"]
                         days = (lim.get("window_minutes") or 0) / 1440
                         note = ("plan limit window (%g days) now at %s%% in total, not only this poll"
-                                % (days, lim["used_percent"]))
+                                % (days, pct))
     if usage:
         inp, cached = num(usage.get("input_tokens")), num(usage.get("cached_input_tokens"))
         fresh = inp - cached if None not in (inp, cached) and inp >= cached else None
         return [row("Codex", fresh, cached, num(usage.get("output_tokens")),
                     num(usage.get("reasoning_output_tokens")), None, "ChatGPT plan",
-                    (note + "; " if note else "") + "reasoning is part of output")]
+                    (note + "; " if note else "") + "reasoning is part of output", pct)]
     m = re.search(r"tokens used\s*\n\s*([\d,]+)", text)
     return [row("Codex", billing="ChatGPT plan",
                 note=("only a total in the log: %s tokens" % m.group(1)) if m else "no token count found")]
