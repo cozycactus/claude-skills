@@ -2,14 +2,17 @@
 """Runner for the multi-model-review skill: one poll = one directory.
 
   poll.py new --src DIR --brief FILE [--models codex,grok] [--run codex,gemini] [--topic WORD]
-               [--attach FILE ...]
+               [--kind spec|plan|code|design|hardware|bug|other] [--attach FILE ...]
       Make ~/.claude/polls/<id>/ with a private snapshot of DIR per model
       (current files, one commit, no history). --attach adds a file such as a
       diff to every copy. Prints one launch command per model.
-  poll.py launch  POLL MODEL    run one model in the foreground (one terminal tab each)
+      A --models entry is provider[:model][@effort], e.g. codex,codex@xhigh,
+      codex:gpt-6.2-sol@max,grok@high: each entry is a slot with a folder of its
+      own (codex, codex+xhigh, codex_gpt-6.2-sol+max, grok+high).
+  poll.py launch  POLL SLOT     run one model in the foreground (one terminal tab each)
   poll.py status  POLL          what each model is doing now, with a hint column
-  poll.py stop    POLL MODEL    interrupt one model and everything it started
-  poll.py answers POLL          check each run and write <model>/answer.md
+  poll.py stop    POLL SLOT     interrupt one model and everything it started
+  poll.py answers POLL          check each run and write <slot>/answer.md; completes <slot>/run.json
   poll.py usage   POLL          token and cost table (Markdown)
   poll.py clean   POLL [--all]  delete the copies (with --all, the whole poll)
   poll.py wait    POLL [--minutes N]   block until a model's state changes (default 4 min), then status
@@ -18,7 +21,7 @@
 POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
 Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
 --run lists the models that may change files and run commands in their copy
-(codex, gemini). DeepSeek can always do that inside its sandboxed copy; Grok
+(codex, gemini; a provider's name covers all its slots). DeepSeek can always do that inside its sandboxed copy; Grok
 never can. Nothing here writes to DIR: every model works in its own copy.
 """
 import argparse
@@ -81,6 +84,7 @@ GEMINI_PRICES = {
 }
 GEMINI_CACHED_FACTOR = 0.05
 
+KINDS = ("spec", "plan", "code", "design", "hardware", "bug", "other")   # what a poll reviews
 MAX_FILES = 20000
 MAX_BYTES = 300 * 1024 * 1024
 MAX_BRIEF = 120 * 1024
@@ -523,7 +527,9 @@ def cmd_new(a):
                     f.write(sandbox_profile(p, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir))
         shutil.rmtree(master)
         meta = {"id": pid, "src": os.path.realpath(a.src), "models": models, "run": sorted(run),
-                "own_data": sorted(own_data), "slots": info,
+                "own_data": sorted(own_data), "slots": info, "kind": a.kind,
+                # how much there was to review, for the statistics
+                "size": {"files": rep["files"], "bytes": rep["bytes"], "brief_chars": len(brief)},
                 "copy": {k: rep[k] for k in ("mode", "files", "bytes", "notes")}}
         with open(os.path.join(root, "poll.json"), "w") as f:
             json.dump(meta, f, indent=1)
@@ -531,7 +537,7 @@ def cmd_new(a):
         shutil.rmtree(root, ignore_errors=True)          # leave no half-made poll behind
         raise
 
-    print("poll: %s" % root)
+    print("poll: %s (kind: %s)" % (root, a.kind))
     print("copy: %s, %d files, %.1f MB; full list in %s" % (rep["mode"], rep["files"], rep["bytes"] / 2 ** 20,
                                                            os.path.join(root, "manifest.txt")))
     for note in rep["notes"]:
@@ -1643,6 +1649,7 @@ def main():
     p.add_argument("--models", default="codex,grok")
     p.add_argument("--run", default="")
     p.add_argument("--topic", default="")
+    p.add_argument("--kind", choices=KINDS, default="other", help="what is reviewed, for the statistics")
     p.add_argument("--force-large", action="store_true")
     p.add_argument("--attach", action="append", metavar="FILE",
                    help="extra file for the reviewers (e.g. a diff); placed in %s/ of every copy" % ATTACH_DIR)
