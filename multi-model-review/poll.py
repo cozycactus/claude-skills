@@ -16,6 +16,7 @@
   poll.py diff    --src DIR [--base REV]   print a diff against a commit, safely, for --attach
 
 POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
+Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
 --run lists the models that may change files and run commands in their copy
 (codex, gemini). DeepSeek can always do that inside its sandboxed copy; Grok
 never can. Nothing here writes to DIR: every model works in its own copy.
@@ -40,7 +41,8 @@ import time
 
 HOME = os.path.realpath(os.path.expanduser("~"))
 SKILL_DIR = os.path.dirname(os.path.realpath(__file__))
-POLLS = os.path.join(HOME, ".claude", "polls")
+# POLLS_ROOT points the commands at another folder of polls, for tests on copies of real polls
+POLLS = os.environ.get("POLLS_ROOT") or os.path.join(HOME, ".claude", "polls")
 MARKER = "===" + " ANSWER " + "==="
 MARKER_RE = re.compile(re.escape(MARKER) + r"[ \t]*\r?$", re.M)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
