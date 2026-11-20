@@ -1061,7 +1061,8 @@ def model_alive(d, info):
 def state(d):
     """(state, result): not started, starting, running, exited, orphaned (launcher gone, model alive), lost."""
     info = pid_info(d)
-    if info and same(info["launcher"], info.get("launcher_born")):
+    # a launcher completing its own record has ended the run: it asks only after writing exit
+    if info and info["launcher"] != os.getpid() and same(info["launcher"], info.get("launcher_born")):
         return "running", None
     code = read(os.path.join(d, "exit")).strip()
     if code:
