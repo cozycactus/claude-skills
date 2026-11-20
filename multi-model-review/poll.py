@@ -63,6 +63,12 @@ CLI_BIN = {"codex": "codex", "deepseek": os.path.join(HOME, ".opencode", "bin", 
            "grok": "cursor-agent", "gemini": "gemini"}
 # how the effort reaches the model: a flag of its own, a suffix of the model id, or the CLI's own choice
 EFFORT_SOURCE = {"codex": "flag", "deepseek": "model-id", "grok": "model-id", "gemini": "cli-default"}
+GROK_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # suffixes that end a cursor-agent model id
+# A --models entry is provider[:model][@effort]. The effort lands inside a TOML string for Codex
+# and the model in argv, so both are kept to plain characters; a leading '-' would read as an option.
+MODEL_RE = r"[A-Za-z0-9][A-Za-z0-9._/#:+-]{0,79}"
+EFFORT_RE = r"[A-Za-z0-9]{1,16}"
+SLOT_DIR_RE = re.compile(r"(%s)([_+][A-Za-z0-9._+-]*)?" % "|".join(ALL_MODELS))
 
 # USD per 1M tokens: (first day, input, output). Cached input costs 5% of input.
 # Sources: https://aistudio.google.com/learn/gemini-4-carbon-developer-guide, read 2026-11-11;
@@ -437,19 +443,25 @@ def data_dirs():
 
 
 def cmd_new(a):
-    models = [m.strip() for m in a.models.split(",") if m.strip()]
-    run = {m.strip() for m in (a.run or "").split(",") if m.strip()}
-    if not models:
+    slots = [parse_slot(s.strip()) for s in a.models.split(",") if s.strip()]
+    if not slots:
         die("no models given")
-    if len(models) != len(set(models)):
-        die("a model is named twice in --models")
-    for m in models:
-        if m not in ALL_MODELS:
-            die("unknown model %r (choose from %s)" % (m, ", ".join(ALL_MODELS)))
-    if run - CAN_RUN:
-        die("--run accepts only: %s" % ", ".join(sorted(CAN_RUN)))
-    if run - set(models):
-        die("--run names a model that is not in --models")
+    for keys, what in ((("slot",), "folder"), (("provider", "model", "effort"), "model and effort")):
+        seen = [tuple(s[k] for k in keys) for s in slots]
+        if len(seen) != len(set(seen)):
+            die("two --models entries have the same %s" % what)
+    models = [s["slot"] for s in slots]
+    info = {s["slot"]: s for s in slots}
+    run = set()
+    for r in (x.strip() for x in (a.run or "").split(",") if x.strip()):
+        # a provider's name covers all its slots; a slot is named as in --models or by its folder
+        hit = [s["slot"] for s in slots if r in (s["provider"], s["spec"], s["slot"])]
+        if not hit:
+            die("--run names %r, which is not in --models" % r)
+        if any(info[m]["provider"] not in CAN_RUN for m in hit):
+            die("--run accepts only: %s" % ", ".join(sorted(CAN_RUN)))
+        run.update(hit)
+    providers = {s["provider"] for s in slots}
     src_real = os.path.realpath(a.src)
     for folder in data_dirs():
         if inside(src_real, folder) or inside(folder, src_real):
@@ -472,7 +484,7 @@ def cmd_new(a):
             continue
     else:
         die("could not create a poll folder")
-    deepseek_isolated = "deepseek" in models and keychain_has(KEYCHAIN["deepseek"][0])
+    deepseek_isolated = "deepseek" in providers and keychain_has(KEYCHAIN["deepseek"][0])
     try:
         master = os.path.join(root, "_src")
         rep = make_copy(a.src, master, a.force_large, a.attach or [])
@@ -485,29 +497,33 @@ def cmd_new(a):
             f.write("\n# not copied: submodules or nested repositories (%d)\n%s\n" % (len(rep["nested"]), "\n".join(rep["nested"])))
             f.write("\n# skipped standard folders, plain copies only (%d)\n%s\n" % (len(rep["skipped"]), "\n".join(rep["skipped"])))
             f.write("\n# notes\n%s\n" % "\n".join(rep["notes"]))
+        own_data = []
         for m in models:
             d = os.path.join(root, m)
+            p = info[m]["provider"]
             os.makedirs(os.path.join(d, "tmp"))
             shutil.copytree(master, os.path.join(d, "copy"), symlinks=True)
-            can_run = m in run or m == "deepseek"
+            can_run = m in run or p == "deepseek"
             with open(os.path.join(d, "brief.txt"), "w", encoding="utf-8") as f:
-                footer = FOOTER_RUN if can_run else (FOOTER_CODEX_RO if m == "codex" else FOOTER_RO)
+                footer = FOOTER_RUN if can_run else (FOOTER_CODEX_RO if p == "codex" else FOOTER_RO)
                 f.write(brief.rstrip("\n") + "\n" + FOOTER_COMMON + footer)
             home_dir = None
-            if m in PRIVATE_HOME:                        # a home of its own, with only the keychain linked in
+            if p in PRIVATE_HOME:                        # a home of its own, with only the keychain linked in
                 home_dir = os.path.join(d, "home")
                 os.makedirs(os.path.join(home_dir, "Library"))
                 os.symlink(os.path.join(HOME, "Library", "Keychains"),
                            os.path.join(home_dir, "Library", "Keychains"))
-            elif m == "deepseek" and deepseek_isolated:  # data folders of its own; HOME stays, for its config
+            elif p == "deepseek" and deepseek_isolated:  # data folders of its own; HOME stays, for its config
                 home_dir = os.path.join(d, "home")
                 os.makedirs(home_dir)
-            if m in WRITE_DIRS:
+            if home_dir:
+                own_data.append(m)
+            if p in WRITE_DIRS:
                 with open(os.path.join(d, "profile.sb"), "w") as f:
-                    f.write(sandbox_profile(m, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir))
+                    f.write(sandbox_profile(p, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir))
         shutil.rmtree(master)
         meta = {"id": pid, "src": os.path.realpath(a.src), "models": models, "run": sorted(run),
-                "own_data": sorted((PRIVATE_HOME & set(models)) | ({"deepseek"} if deepseek_isolated else set())),
+                "own_data": sorted(own_data), "slots": info,
                 "copy": {k: rep[k] for k in ("mode", "files", "bytes", "notes")}}
         with open(os.path.join(root, "poll.json"), "w") as f:
             json.dump(meta, f, indent=1)
@@ -530,11 +546,18 @@ def cmd_new(a):
     print("\nLAUNCH: one terminal tab per command, each typed exactly as printed:")
     for m in models:
         print("python3 %s launch %s %s" % (me, pid, m))
+    width = max(8, max(len(m) for m in models))
+    print("\nModel and effort per slot:")
+    for m in models:
+        s = info[m]
+        print("  %-*s %s, effort %s (%s)" % (width, m, s["model_arg"], s["effort"] or "the CLI's default",
+                                          s["effort_source"]))
     print("\nWhat each model can do:")
     for m in models:
-        text = ACCESS_DEEPSEEK_ISOLATED if m == "deepseek" and deepseek_isolated else ACCESS[(m, m in run)]
-        print("  %-8s %s" % (m, text))
-    if "deepseek" in models and not deepseek_isolated:
+        p = info[m]["provider"]
+        text = ACCESS_DEEPSEEK_ISOLATED if p == "deepseek" and deepseek_isolated else ACCESS[(p, m in run)]
+        print("  %-*s %s" % (width, m, text))
+    if "deepseek" in providers and not deepseek_isolated:
         print("note: no keychain item %r, so DeepSeek shares opencode's real data folder" % KEYCHAIN["deepseek"][0])
 
 
@@ -580,12 +603,68 @@ def model_arg(provider, model, effort):
     return model
 
 
-def child_argv(model, d, pid, run, brief, policy):
+def split_model(provider, s):
+    """(model, effort) of a model string as its CLI takes it: DeepSeek 'id#effort', Grok 'id-effort'."""
+    if provider == "deepseek" and "#" in s:
+        return tuple(s.rsplit("#", 1))
+    m = re.fullmatch(r"(.+)-(%s)" % "|".join(GROK_EFFORTS), s) if provider == "grok" else None
+    return (m.group(1), m.group(2)) if m else (s, None)
+
+
+def parse_slot(spec):
+    """A --models entry, provider[:model][@effort], as a slot: its folder name, provider, model and effort.
+
+    Parts left out take the provider's defaults. The default slot keeps the plain provider
+    name as its folder, as in polls made before variants; a variant's folder spells ':' as
+    '_', '@' as '+' and anything else unsafe in a file name or a shell word as '_'."""
+    m = re.fullmatch(r"(%s)(?::(%s))?(?:@(%s))?" % ("|".join(ALL_MODELS), MODEL_RE, EFFORT_RE), spec)
+    if not m:
+        die("bad --models entry %r: write provider[:model][@effort], provider one of %s, the model in "
+            "letters, digits and ._/#:+- and the effort in letters and digits" % (spec, ", ".join(ALL_MODELS)))
+    provider, model, effort = m.groups()
+    if provider == "gemini" and effort:
+        die("%r: the Gemini CLI has no option for the thinking level, so gemini@effort is refused; "
+            "gemini:<model> is fine" % spec)
+    if model:
+        model, inner = split_model(provider, model)
+        if inner and effort and inner != effort:
+            die("%r names two efforts" % spec)
+        effort = effort or inner
+    model = model or DEFAULTS[provider][0]
+    effort = effort or DEFAULTS[provider][1]
+    folder = provider if spec == provider else re.sub(r"[^A-Za-z0-9._+-]", "_", spec.replace("@", "+"))
+    return {"slot": folder, "spec": spec, "provider": provider, "model": model, "effort": effort,
+            "effort_source": EFFORT_SOURCE[provider], "model_arg": model_arg(provider, model, effort)}
+
+
+def slot_info(meta, m):
+    """What the poll knows about slot m. Polls made before variants name only providers: model unknown."""
+    info = (meta.get("slots") or {}).get(m)
+    if isinstance(info, dict) and info.get("provider") in ALL_MODELS:
+        return info
+    return {"slot": m, "spec": m, "provider": m if m in ALL_MODELS else None, "model": None, "effort": None,
+            "effort_source": EFFORT_SOURCE.get(m), "model_arg": None}
+
+
+def provider_of(meta, m):
+    return slot_info(meta, m)["provider"]
+
+
+def find_slot(meta, name):
+    """The slot a command names, by folder or by its --models spelling."""
+    for m in meta["models"]:
+        if name in (m, slot_info(meta, m).get("spec")):
+            return m
+    die("%s is not part of this poll (its slots: %s)" % (name, ", ".join(meta["models"])))
+
+
+def child_argv(info, d, pid, run, brief, policy):
     copy = os.path.join(d, "copy")
-    name, effort = DEFAULTS[model]
+    model = info["provider"]
+    name, effort = info["model"], info["effort"]
     if model == "codex":
-        return [CLI_BIN[model], "exec", "--ignore-user-config", "-m", name,
-                "-c", 'model_reasoning_effort="%s"' % effort,
+        return [CLI_BIN[model], "exec", "--ignore-user-config", "-m", name] + (
+                ["-c", 'model_reasoning_effort="%s"' % effort] if effort else []) + [
                 # without this, workspace-write could also write anywhere under /tmp
                 "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
                 "-s", "workspace-write" if run else "read-only", "--skip-git-repo-check",
@@ -697,9 +776,12 @@ def poll_lock(root, exclusive):
 def cmd_launch(a):
     root = poll_dir(a.poll)
     meta = meta_of(root)
-    m = a.model
-    if m not in meta["models"]:
-        die("%s is not part of this poll" % m)
+    m = find_slot(meta, a.model)
+    info = slot_info(meta, m)
+    p = info["provider"]
+    if not info["model"]:                                # a poll made before variants runs today's defaults
+        name, effort = DEFAULTS[p]
+        info = dict(info, model=name, effort=effort, model_arg=model_arg(p, name, effort))
     d = model_dir(root, m)
     run = m in meta.get("run", [])
     lock = poll_lock(root, exclusive=False)              # held until this launcher exits
@@ -711,13 +793,13 @@ def cmd_launch(a):
         die("%s was already launched in this poll; make a new poll to try again" % m, 94)
     me = {"launcher": os.getpid(), "launcher_born": born(os.getpid()), "started": int(time.time())}
     write_json(os.path.join(d, "pid"), me)               # visible before the model exists
-    env = child_env(m, d, m in meta.get("own_data", []))
-    if m == "gemini":                                    # its own sandbox is built around the system temp folder
+    env = child_env(p, d, m in meta.get("own_data", []))
+    if p == "gemini":                                    # its own sandbox is built around the system temp folder
         env["TMPDIR"] = os.environ.get("TMPDIR") or tempfile.gettempdir()
     else:
         env["TMPDIR"] = os.path.join(d, "tmp") + os.sep
-    rec = run_base(meta, m)                              # what is known before the model starts
-    rec.update(cli_version=cli_version(CLI_BIN[m], env, os.path.join(d, "copy")), status="running",
+    rec = run_base(meta, m, info)                        # what is known before the model starts
+    rec.update(cli_version=cli_version(CLI_BIN[p], env, os.path.join(d, "copy")), status="running",
                started=me["started"], started_iso=iso(me["started"]))
     try:
         write_run(d, rec)
@@ -725,7 +807,7 @@ def cmd_launch(a):
         sys.stderr.write("[poll] could not write %s: %s\n" % (RUN, e))
     brief = open(os.path.join(d, "brief.txt"), encoding="utf-8").read()
     policy = None
-    if m == "gemini" and not run:
+    if p == "gemini" and not run:
         source = open(os.path.join(SKILL_DIR, "gemini-readonly.toml"), "rb").read()
         try:
             import tomllib
@@ -739,8 +821,8 @@ def cmd_launch(a):
         fd, policy = tempfile.mkstemp(prefix="poll-readonly-", suffix=".toml")
         with os.fdopen(fd, "wb") as f:
             f.write(source)
-    argv = child_argv(m, d, meta["id"], run, brief, policy)
-    stdin = open(os.path.join(d, "brief.txt"), "rb") if m == "codex" else subprocess.DEVNULL
+    argv = child_argv(info, d, meta["id"], run, brief, policy)
+    stdin = open(os.path.join(d, "brief.txt"), "rb") if p == "codex" else subprocess.DEVNULL
     flags = {"policy_error": False, "stop": False, "interrupted": False}
 
     def on_signal(signum, frame):
@@ -755,7 +837,7 @@ def cmd_launch(a):
     except OSError as e:
         with open(os.path.join(d, "exit"), "w") as f:
             f.write("127\n")
-        finish_record(d, m)
+        finish_record(d, p)
         die("could not start %s: %s" % (argv[0], e), 127)
     result = "launcher-error"
     known = {}                                           # pid -> birth of everything the model started
@@ -847,7 +929,7 @@ def cmd_launch(a):
                 pass
         with open(os.path.join(d, "exit"), "w") as f:
             f.write(result + "\n")
-        finish_record(d, m)                              # after exit: the record reads the result from it
+        finish_record(d, p)                              # after exit: the record reads the result from it
         sys.stderr.write("\n[poll] %s finished: %s\n" % (m, result))
     sys.exit(0 if result == "0" else 1)
 
@@ -864,9 +946,16 @@ def poll_dir(arg):
     return p
 
 
+def meta_ok(meta):
+    """Does poll.json name its slots as folders this script would make, each of a known provider?"""
+    return (isinstance(meta, dict) and isinstance(meta.get("models"), list) and isinstance(meta.get("slots", {}), dict)
+            and all(isinstance(m, str) and SLOT_DIR_RE.fullmatch(m) and provider_of(meta, m) in ALL_MODELS
+                    and m.startswith(provider_of(meta, m)) for m in meta["models"]))
+
+
 def meta_of(root):
     meta = json.load(open(os.path.join(root, "poll.json")))
-    if not isinstance(meta.get("models"), list) or any(m not in ALL_MODELS for m in meta["models"]):
+    if not meta_ok(meta):
         die("poll.json names an unknown model")
     return meta
 
@@ -874,7 +963,7 @@ def meta_of(root):
 def model_dir(root, m):
     """The model's folder, refused when it is a link or leaves the poll."""
     d = os.path.join(root, m)
-    if m not in ALL_MODELS or os.path.islink(d) or not os.path.isdir(d) or os.path.realpath(d) != d:
+    if not SLOT_DIR_RE.fullmatch(m) or os.path.islink(d) or not os.path.isdir(d) or os.path.realpath(d) != d:
         die("unexpected layout in the poll folder: %s" % d)
     return d
 
@@ -1068,12 +1157,12 @@ def cmd_answers(a):
                 os.remove(os.path.join(d, stale))
             except OSError:
                 pass
-        finish_record(d, m)
+        finish_record(d, provider_of(meta, m))
         st, code = state(d)
         if st != "exited":
             print("| %s | %s | | no answer taken |" % (m, st))
             continue
-        text, problem, answer, notes, kind = take(m, d, code)
+        text, problem, answer, notes, kind = take(provider_of(meta, m), d, code)
 
         def save(name, body):
             path = os.path.join(d, name)
@@ -1158,12 +1247,13 @@ def cli_version(argv0, env, cwd):
     return lines[0][:200] if code == 0 and lines else None
 
 
-def run_base(meta, m):
+def run_base(meta, m, info):
     """The part of a run record that is known before the model starts."""
-    model, effort = DEFAULTS[m]
-    return {"slot": m, "provider": m, "model": model, "effort": effort, "effort_source": EFFORT_SOURCE[m],
-            "model_arg": model_arg(m, model, effort), "cli": os.path.basename(CLI_BIN[m]), "cli_version": None,
-            "mode": "run" if m in meta.get("run", []) or m == "deepseek" else "read",
+    p = info["provider"]
+    return {"slot": m, "provider": p, "model": info["model"], "effort": info["effort"],
+            "effort_source": EFFORT_SOURCE[p], "model_arg": info["model_arg"],
+            "cli": os.path.basename(CLI_BIN[p]), "cli_version": None,
+            "mode": "run" if m in meta.get("run", []) or p == "deepseek" else "read",
             "poll": meta.get("id"), "poll_kind": meta.get("kind"), "inferred": False}
 
 
@@ -1264,7 +1354,8 @@ def cmd_status(a):
     now = time.time()
     print("| model | state | running for | log quiet for | log size | last step | hint |")
     print("| --- | --- | ---: | ---: | ---: | --- | --- |")
-    for m in meta_of(root)["models"]:
+    meta = meta_of(root)
+    for m in meta["models"]:
         d = model_dir(root, m)
         st, code = state(d)
         info = pid_info(d) or {}
@@ -1290,11 +1381,13 @@ def cmd_status(a):
         print("| %s | %s | %s | %s | %s | %s | %s |" % (
             m, label, "" if ran_min is None else "%d min" % ran_min,
             "" if quiet_min is None else "%d min" % quiet_min, "{:,}".format(size),
-            cell(last_step(m, d)), hint))
+            cell(last_step(provider_of(meta, m), d)), hint))
 
 
 def cmd_stop(a):
     root = poll_dir(a.poll)
+    meta = meta_of(root)
+    a.model = find_slot(meta, a.model)
     d = model_dir(root, a.model)
     info = pid_info(d)
     st = state(d)[0]
@@ -1316,7 +1409,7 @@ def cmd_stop(a):
             % (a.model, ", ".join(map(str, left))))
     with open(os.path.join(d, "exit"), "w") as f:
         f.write("stopped\n")
-    finish_record(d, a.model)
+    finish_record(d, provider_of(meta, a.model))
     print("%s: stopped" % a.model)
 
 
@@ -1499,16 +1592,21 @@ def cell(v):
 def cmd_usage(a):
     root = poll_dir(a.poll)
     rows = []
-    for m in meta_of(root)["models"]:
+    meta = meta_of(root)
+    for m in meta["models"]:
         d = model_dir(root, m)
+        p = provider_of(meta, m)
         st, code = state(d)
         if st == "not started":
-            rows.append(row(m, billing=BILLING[m], note="not started"))
+            rows.append(row(m, billing=BILLING[p], note="not started"))
             continue
         try:
-            got = USAGE[m](d)
+            got = USAGE[p](d)
         except Exception as e:                           # one bad log must not lose the table
-            got = [row(m, billing=BILLING[m], note="could not read usage: %s: %s" % (type(e).__name__, e))]
+            got = [row(m, billing=BILLING[p], note="could not read usage: %s: %s" % (type(e).__name__, e))]
+        for r in got:                                    # two slots of one provider: say which row is which
+            if m != p and r["model"] != m:
+                r["model"] = "%s: %s" % (m, r["model"])
         if st != "exited" or code != "0":
             for r in got:
                 r["note"] = "run %s; figures may be incomplete; %s" % (st if st != "exited" else "ended with " + code, r["note"])
@@ -1556,7 +1654,7 @@ def main():
     for name, fn in (("launch", cmd_launch), ("stop", cmd_stop)):
         p = sub.add_parser(name)
         p.add_argument("poll")
-        p.add_argument("model", choices=ALL_MODELS)
+        p.add_argument("model", metavar="SLOT", help="a slot of the poll: codex, codex+xhigh, ...")
         p.set_defaults(fn=fn)
     p = sub.add_parser("clean")
     p.add_argument("poll")
