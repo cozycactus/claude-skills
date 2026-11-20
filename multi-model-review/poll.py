@@ -17,7 +17,7 @@
   poll.py clean   POLL [--all]  delete the copies (with --all, the whole poll)
   poll.py wait    POLL [--minutes N]   block until a model's state changes (default 4 min), then status
   poll.py diff    --src DIR [--base REV]   print a diff against a commit, safely, for --attach
-  poll.py finding | findings ...           verdicts on what the models found: see stats.py
+  poll.py finding | findings | missed ...  verdicts on what the models found, and what they missed: see stats.py
 
 POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
 Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
@@ -1643,7 +1643,7 @@ def cmd_usage(a):
 
 # Read or written after a poll ran, so they live in stats.py, which is loaded only for them:
 # a fault there cannot stop a launch.
-STATS_COMMANDS = ("finding", "findings")
+STATS_COMMANDS = ("finding", "findings", "missed")
 
 
 def main():

@@ -10,7 +10,10 @@ poll.py forwards these commands here, so they are written `poll.py <command>`:
       the other slots that reported the same thing.
   poll.py finding  POLL --update ID [--verdict V] [--severity S] [--also SLOT[,SLOT]] [--how H] [--note TEXT]
       Change a finding later. An update is appended; nothing earlier is rewritten.
-  poll.py findings POLL         the findings as they stand now
+  poll.py findings POLL         the findings as they stand now, and the misses
+  poll.py missed   POLL "what the reviewers missed" --found-by ci|user|test|advisor|poll|other [--note TEXT]
+      Record a defect in the reviewed work that surfaced later and no reviewer reported,
+      as M1, M2, ... in <poll>/missed.jsonl.
 
 Everything here only reads the polls, except the commands that record something,
 which append to files of their own in the poll folder. Nothing here starts a model.
@@ -27,7 +30,9 @@ import poll as P
 VERDICTS = ("confirmed", "refuted", "not-taken", "unverified")
 SEVERITIES = ("high", "medium", "low")
 HOW = ("test", "code", "compiler", "reasoning", "other")
+FOUND_BY = ("ci", "user", "test", "advisor", "poll", "other")
 FINDINGS = "findings.jsonl"
+MISSED = "missed.jsonl"
 
 
 def records(path):
@@ -94,6 +99,10 @@ def findings_of(root):
     return fold(records(os.path.join(root, FINDINGS)))
 
 
+def misses_of(root):
+    return [r for r in records(os.path.join(root, MISSED)) if r.get("type") == "miss"]
+
+
 def cmd_finding(a):
     root = P.poll_dir(a.poll)
     meta = P.meta_of(root)
@@ -128,6 +137,17 @@ def cmd_finding(a):
     print("%s %s: %s" % ("updated" if a.update else "recorded", rec["id"], path))
 
 
+def cmd_missed(a):
+    root = P.poll_dir(a.poll)
+    P.meta_of(root)
+    if not a.what.strip():
+        P.die("say what the reviewers missed")
+    path = os.path.join(root, MISSED)
+    rec = append(path, lambda old: stamp({"type": "miss", "id": next_id(old, "miss", "M"), "what": a.what.strip(),
+                                          "found_by": a.found_by, "note": a.note}))
+    print("recorded %s: %s" % (rec["id"], path))
+
+
 def cmd_findings(a):
     root = P.poll_dir(a.poll)
     found = findings_of(root)
@@ -145,6 +165,13 @@ def cmd_findings(a):
                 f.get("how"), f.get("claim"), f.get("note"))))
         count = {v: sum(1 for f in found if f.get("verdict") == v) for v in VERDICTS}
         print("\n%d finding(s): %s." % (len(found), ", ".join("%s %d" % kv for kv in count.items())))
+    missed = misses_of(root)
+    if missed:
+        print("\nMissed by every reviewer, found later:\n")
+        print("| id | found by | what | note |")
+        print("| --- | --- | --- | --- |")
+        for r in missed:
+            print("| %s |" % " | ".join(P.cell(r.get(k) or "") for k in ("id", "found_by", "what", "note")))
 
 
 def main(argv=None):
@@ -165,6 +192,12 @@ def main(argv=None):
     p = sub.add_parser("findings")
     p.add_argument("poll")
     p.set_defaults(fn=cmd_findings)
+    p = sub.add_parser("missed")
+    p.add_argument("poll")
+    p.add_argument("what")
+    p.add_argument("--found-by", required=True, choices=FOUND_BY)
+    p.add_argument("--note")
+    p.set_defaults(fn=cmd_missed)
     a = ap.parse_args(argv)
     a.fn(a)
 
