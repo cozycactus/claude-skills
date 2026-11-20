@@ -19,6 +19,7 @@
   poll.py diff    --src DIR [--base REV]   print a diff against a commit, safely, for --attach
   poll.py finding | findings | missed ...  verdicts on what the models found, and what they missed
   poll.py stats [--by ...] [--pairs]        how each model and effort did over all polls: see stats.py
+  poll.py backfill [--dry-run]             run.json for older polls, inferred from their files
 
 POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
 Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
@@ -1644,7 +1645,7 @@ def cmd_usage(a):
 
 # Read or written after a poll ran, so they live in stats.py, which is loaded only for them:
 # a fault there cannot stop a launch.
-STATS_COMMANDS = ("finding", "findings", "missed", "stats")
+STATS_COMMANDS = ("finding", "findings", "missed", "stats", "backfill")
 
 
 def main():

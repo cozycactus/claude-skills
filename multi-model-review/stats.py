@@ -18,12 +18,17 @@ poll.py forwards these commands here, so they are written `poll.py <command>`:
       How each group of runs did over every poll in the polls folder: runs, problems by
       category, time, tokens, cost, and the verdicts on what it found. --pairs puts side
       by side the polls that ran two slots of one provider, which is the fair comparison.
+  poll.py backfill [--dry-run]
+      Write <slot>/run.json, marked "inferred", for every slot of an older poll that has none,
+      never overwriting one. --dry-run prints what it would write.
 
-Everything here only reads the polls, except the commands that record something,
-which append to files of their own in the poll folder. Nothing here starts a model.
+Everything here only reads the polls, except that finding and missed append to files
+of their own in a poll folder and backfill adds missing run.json files. Nothing here
+starts a model.
 """
 import argparse
 import fcntl
+import glob
 import json
 import os
 import re
@@ -222,16 +227,9 @@ def slot_dirs(root, meta, notes):
 
 
 def record_of(root, meta, m, d):
-    """The slot's run record: its run.json when there is one, else worked out in memory from its files."""
+    """The slot's run record: its run.json when there is one, else what backfill would write."""
     rec = P.read_run(d)
-    if rec is not None:
-        return rec
-    info = P.slot_info(meta, m)
-    rec = {"slot": m, "provider": info["provider"], "model": info["model"], "effort": info["effort"],
-           "effort_source": info.get("effort_source"), "inferred": True,
-           "source": "poll.json" if info["model"] else "none: run backfill"}
-    rec.update(P.observe(info["provider"], d))
-    return rec
+    return rec if rec is not None else infer(root, meta, m, d)
 
 
 # ---------------------------------------------------------------- stats
@@ -442,6 +440,263 @@ def cmd_stats(a):
         print("note: " + n)
 
 
+# ---------------------------------------------------------------- what old polls ran (backfill)
+
+# The model strings in force after each commit of the skill: poll.py's constants, or the command
+# lines of the first SKILL.md, from before poll.py existed.
+CONST_RE = re.compile(r'^\+(CODEX|DEEPSEEK|GROK|GEMINI)_(MODEL|EFFORT)\s*=\s*"([^"]+)"')
+SKILL_CMD_RE = [
+    ("codex", "MODEL", re.compile(r"\bcodex exec\b.*?\s-m\s+([\w.\-/#]+)")),
+    ("codex", "EFFORT", re.compile(r'model_reasoning_effort="?(\w+)')),
+    ("deepseek", "MODEL", re.compile(r"\bopencode\b.*?\brun\b.*?\s-m\s+'?([\w.\-/#]+)")),
+    ("grok", "MODEL", re.compile(r"\bcursor-agent\b.*?--model\s+([\w.\-]+)")),
+    ("gemini", "MODEL", re.compile(r"\b(?:agy|gemini)\b.*?--model\s+([\w.\-]+)")),
+]
+# The command lines of the shell launcher the first polls had, in <slot>/run.sh
+RUNSH_RE = {
+    "codex": (re.compile(r"\bcodex exec\b.*?\s-m\s+([\w.\-/#]+)"), re.compile(r'model_reasoning_effort="?(\w+)')),
+    "deepseek": (re.compile(r"\bopencode\b.*?\s-m\s+'?([\w.\-/#]+)"), None),
+    "grok": (re.compile(r"\bcursor-agent\b.*?--model\s+([\w.\-]+)"), None),
+    "gemini": (re.compile(r"\bgemini\b.*?\s(?:-m|--model)\s+([\w.\-]+)"), None),
+}
+DISPLAY_EFFORT = {"low": "low", "medium": "medium", "high": "high", "extra high": "xhigh", "max": "max"}
+_timeline = []
+
+
+def note_model(state, provider, what, value):
+    s = state.setdefault(provider, [None, None])
+    if what == "MODEL":
+        s[0], effort = P.split_model(provider, value)
+        s[1] = effort or s[1]                            # "grok-4.7-high" says the effort, "grok-4.7" does not
+    else:
+        s[1] = value
+
+
+def git_timeline():
+    """[(commit time, short hash, {provider: (model, effort)})], oldest first."""
+    if not _timeline:
+        out = P.git(["log", "-p", "--reverse", "--no-ext-diff", "--no-textconv", "--format=COMMIT %h %ct",
+                     "--", "poll.py", "SKILL.md"], P.SKILL_DIR, check=False, text=True)
+        state, cur = {}, None
+        for line in (out.stdout if out.returncode == 0 else "").splitlines() + ["COMMIT end 0"]:
+            if line.startswith("COMMIT "):
+                if cur:
+                    _timeline.append((cur[1], cur[0], {p: tuple(v) for p, v in state.items()}))
+                h, ct = line.split()[1:3]
+                cur = (h, int(ct))
+                continue
+            m = CONST_RE.match(line)
+            if m:
+                note_model(state, m.group(1).lower(), m.group(2), m.group(3))
+            elif line.startswith("+"):
+                for provider, what, rx in SKILL_CMD_RE:
+                    hit = rx.search(line)
+                    if hit:
+                        note_model(state, provider, what, hit.group(1))
+    return _timeline
+
+
+def git_models(t):
+    """({provider: (model, effort)}, which commit says so) in force at time t."""
+    best = None
+    for ct, h, state in git_timeline():
+        if t is not None and ct <= t:
+            best = (ct, h, state)
+    if not best:
+        return {}, None
+    return best[2], "skill git history: %s of %s" % (best[1], time.strftime("%Y-%m-%d %H:%M", time.localtime(best[0])))
+
+
+def poll_time(pid):
+    """Epoch of the local time stamp a poll id starts with."""
+    try:
+        return int(time.mktime(time.strptime(pid[:15], "%Y%m%d-%H%M%S")))
+    except ValueError:
+        return None
+
+
+def head(path, size=8192):
+    try:
+        with open(path, "rb") as f:
+            return f.read(size).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def open_lines(path):
+    if path.endswith(".zst"):
+        from compression import zstd                     # Python 3.14 and later
+        return zstd.open(path, "rt", errors="replace")
+    return open(path, errors="replace")
+
+
+def session_settings(path, want):
+    """(model, effort, CLI version) of a Codex session whose working folder ends with want, else None.
+    Stops at the first turn's settings; the internal model codex-auto-review is not the run's."""
+    version = None
+    try:
+        with open_lines(path) as f:
+            for n, line in enumerate(f):
+                if n > 2000:
+                    break
+                if '"session_meta"' not in line and '"turn_context"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                p = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+                if not str(p.get("cwd") or "").endswith(want):
+                    return None
+                if e.get("type") == "session_meta":
+                    version = p.get("cli_version")
+                elif e.get("type") == "turn_context" and p.get("model") and p["model"] != "codex-auto-review":
+                    mode = p.get("collaboration_mode") if isinstance(p.get("collaboration_mode"), dict) else {}
+                    settings = mode.get("settings") if isinstance(mode.get("settings"), dict) else {}
+                    return p["model"], p.get("effort") or settings.get("reasoning_effort"), version
+    except (OSError, ImportError, EOFError, ValueError):
+        return None
+    return None
+
+
+def sessions_by_cwd(want, t):
+    """Codex session files from the poll's day and the next whose first line names the slot's copy."""
+    out = []
+    for day in ((t, t + 86400) if t else ()):
+        folder = os.path.join(P.HOME, ".codex", "sessions", time.strftime("%Y/%m/%d", time.localtime(day)))
+        for f in sorted(glob.glob(os.path.join(folder, "rollout-*.jsonl")) + glob.glob(os.path.join(folder, "rollout-*.jsonl.zst"))):
+            try:
+                with open_lines(f) as fh:
+                    if want in fh.readline():
+                        out.append(f)
+            except (OSError, ImportError, EOFError, ValueError):
+                pass
+    return out
+
+
+def codex_evidence(pid, m, d, t):
+    """(model, effort, CLI version, source) of a Codex run: its session file, found by the session id
+    in its stderr or else by its working folder; failing that, the header of its stderr."""
+    err = head(os.path.join(d, "err"))
+    want = os.sep + os.path.join(pid, m, "copy")
+    sid = re.search(r"session id:\s*([0-9a-f-]{20,})", err, re.I)
+    for f in (P.codex_sessions(sid.group(1)) if sid else sessions_by_cwd(want, t)):
+        got = session_settings(f, want)
+        if got:
+            return got + ("Codex session: %s" % os.path.basename(f),)
+    model = re.search(r"^model:\s*(\S+)", err, re.M)
+    if model:
+        effort = re.search(r"^reasoning effort:\s*(\S+)", err, re.M)
+        version = re.search(r"^OpenAI Codex v(\S+)", err, re.M)
+        return (model.group(1), effort and effort.group(1), version and version.group(1), "Codex stderr: header")
+    return None
+
+
+def log_model(d):
+    """(model, cursor-agent?) the CLI announced in its first event: Gemini CLI gives the id,
+    cursor-agent a display name such as 'Grok 4.7 256K High'."""
+    for line in head(os.path.join(d, "log")).splitlines()[:5]:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") in ("init", "system") and isinstance(e.get("model"), str):
+            return e["model"], e.get("type") == "system"
+    return None, False
+
+
+def from_display(name):
+    """('grok-4.7', 'high') from cursor-agent's 'Grok 4.7 256K High'; None when it does not read that way."""
+    m = re.fullmatch(r"(.+?) (extra high|high|medium|low|max)", name.strip(), re.I)
+    if not m:
+        return None
+    words = [w.lower() for w in m.group(1).split() if not re.fullmatch(r"\d+[km]", w, re.I)]   # 256K: context size
+    return "-".join(words), DISPLAY_EFFORT[m.group(2).lower()]
+
+
+def infer(root, meta, m, d):
+    """A run record for a slot that has none, from the best evidence there is: the poll's own
+    slots, then the run's own files (run.sh, Codex's session, the CLI's first event), and the
+    skill's git history last, which is wrong for runs made with uncommitted settings."""
+    info = P.slot_info(meta, m)
+    p = info["provider"]
+    pid = os.path.basename(root)
+    t = poll_time(pid)
+    model, effort, version, source = info["model"], info["effort"], None, "poll.json" if info["model"] else None
+    effort_source, cli = P.EFFORT_SOURCE[p], os.path.basename(P.CLI_BIN[p])
+    shown, via_cursor = log_model(d)
+    if not source and os.path.exists(os.path.join(d, "run.sh")):
+        text = P.read(os.path.join(d, "run.sh"))
+        rx_model, rx_effort = RUNSH_RE[p]
+        hit = rx_model.search(text)
+        if hit:
+            model, effort = P.split_model(p, hit.group(1))
+            hit = rx_effort.search(text) if rx_effort else None
+            effort, source = (hit.group(1) if hit else effort), "run.sh"
+    if not source and p == "codex":
+        got = codex_evidence(pid, m, d, t)
+        if got:
+            model, effort, version, source = got
+    if not source and shown:
+        if not via_cursor and re.fullmatch(P.MODEL_RE, shown):
+            model, source = shown, "%s log: first event" % p
+        elif from_display(shown):
+            (model, effort), source = from_display(shown), "cursor-agent log: display name %r" % shown
+            if p != "grok":                              # a model reached through cursor-agent, as in one test poll
+                effort_source, cli = "model-id", "cursor-agent"
+    if not source:
+        state, source = git_models(t)
+        model, effort = state.get(p, (None, None))
+        source = source if model else "nothing: no file or commit names the model"
+    rec = {"slot": m, "provider": p, "model": model, "effort": effort, "effort_source": effort_source,
+           "model_arg": P.model_arg(p, model, effort) if model else None, "cli": cli, "cli_version": version,
+           "cli_model": shown, "mode": "run" if m in meta.get("run", []) or p == "deepseek" else "read",
+           "poll": meta.get("id") or pid, "poll_kind": meta.get("kind"), "inferred": True, "source": source,
+           "missing": [f for f, alts in (("pid", ("pid", "started")), ("exit", ("exit",)), ("log", ("log", "err")))
+                       if not any(os.path.exists(os.path.join(d, x)) for x in alts)]}
+    rec.update(P.observe(p, d))
+    return rec
+
+
+def cmd_backfill(a):
+    notes, tally, skipped = [], {}, {}
+    for root, meta in all_polls(notes):
+        for m, d in slot_dirs(root, meta, notes):
+            path = os.path.join(d, P.RUN)
+            if os.path.lexists(path):
+                skipped["has run.json"] = skipped.get("has run.json", 0) + 1
+                continue
+            rec = infer(root, meta, m, d)
+            where = "%s/%s" % (os.path.basename(root), m)
+            if rec["status"] in ("running", "not started"):
+                skipped[rec["status"]] = skipped.get(rec["status"], 0) + 1
+                print("skip %s: %s" % (where, rec["status"]))
+                continue
+            line = "%s: %s %s @%s, %s%s, from %s%s" % (
+                where, rec["provider"], rec["model"] or "?", effort_label(rec), rec["status"],
+                " (%s)" % rec["failure"] if rec["failure"] else "", rec["source"],
+                "; missing: %s" % ", ".join(rec["missing"]) if rec["missing"] else "")
+            if not a.dry_run:
+                try:                                     # never overwrite: a record may have appeared meanwhile
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    skipped["has run.json"] = skipped.get("has run.json", 0) + 1
+                    continue
+                with os.fdopen(fd, "w") as f:
+                    json.dump(rec, f, indent=1)
+            print(("would write " if a.dry_run else "wrote ") + line)
+            key = (rec["provider"], rec["model"] or "?", effort_label(rec), rec["source"].split(":")[0])
+            tally[key] = tally.get(key, 0) + 1
+    print("\n%s %d record(s):" % ("Would write" if a.dry_run else "Wrote", sum(tally.values())))
+    print("| provider | model | effort | evidence | runs |\n| --- | --- | --- | --- | ---: |")
+    for key, n in sorted(tally.items()):
+        print("| %s | %d |" % (" | ".join(key), n))
+    if skipped:
+        print("Skipped: %s." % ", ".join("%s %d" % kv for kv in sorted(skipped.items())))
+    for n in notes:
+        print("note: " + n)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="poll.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -473,6 +728,9 @@ def main(argv=None):
     p.add_argument("--pairs", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_stats)
+    p = sub.add_parser("backfill")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_backfill)
     a = ap.parse_args(argv)
     a.fn(a)
 
