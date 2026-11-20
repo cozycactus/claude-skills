@@ -17,6 +17,7 @@
   poll.py clean   POLL [--all]  delete the copies (with --all, the whole poll)
   poll.py wait    POLL [--minutes N]   block until a model's state changes (default 4 min), then status
   poll.py diff    --src DIR [--base REV]   print a diff against a commit, safely, for --attach
+  poll.py finding | findings ...           verdicts on what the models found: see stats.py
 
 POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
 Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
@@ -1640,7 +1641,16 @@ def cmd_usage(a):
           "Models on a plan show tokens only. The coordinating agent's own tokens are not counted.")
 
 
+# Read or written after a poll ran, so they live in stats.py, which is loaded only for them:
+# a fault there cannot stop a launch.
+STATS_COMMANDS = ("finding", "findings")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in STATS_COMMANDS:
+        sys.path.insert(0, SKILL_DIR)
+        import stats
+        return stats.main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("new")
