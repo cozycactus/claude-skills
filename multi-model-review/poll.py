@@ -21,11 +21,12 @@
   poll.py stats [--by ...] [--pairs]        how each model and effort did over all polls: see stats.py
   poll.py backfill [--dry-run]             run.json for older polls, inferred from their files
 
-POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini.
+POLL is the poll directory or its id. Models: codex, deepseek, grok, gemini, agy
+(Antigravity's CLI: Gemini 4 Neon on the user's Google plan).
 Polls live in ~/.claude/polls, or in $POLLS_ROOT when that is set (for tests).
 --run lists the models that may change files and run commands in their copy
 (codex, gemini; a provider's name covers all its slots). DeepSeek can always do that inside its sandboxed copy; Grok
-never can. Nothing here writes to DIR: every model works in its own copy.
+and agy never can. Nothing here writes to DIR: every model works in its own copy.
 """
 import argparse
 import datetime
@@ -52,9 +53,10 @@ POLLS = os.environ.get("POLLS_ROOT") or os.path.join(HOME, ".claude", "polls")
 MARKER = "===" + " ANSWER " + "==="
 MARKER_RE = re.compile(re.escape(MARKER) + r"[ \t]*\r?$", re.M)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-ALL_MODELS = ["codex", "deepseek", "grok", "gemini"]
+ALL_MODELS = ["codex", "deepseek", "grok", "gemini", "agy"]
 CAN_RUN = {"codex", "gemini"}
-BILLING = {"codex": "ChatGPT plan", "grok": "Cursor plan", "deepseek": "per token", "gemini": "per token"}
+BILLING = {"codex": "ChatGPT plan", "grok": "Cursor plan", "deepseek": "per token", "gemini": "per token",
+           "agy": "Google AI plan"}
 
 CODEX_MODEL = "gpt-6.2-astra"
 CODEX_EFFORT = "max"
@@ -63,13 +65,20 @@ DEEPSEEK_EFFORT = "max"
 GROK_MODEL = "grok-4.7"                          # cursor-agent gets "<model>-<effort>"
 GROK_EFFORT = "xhigh"
 GEMINI_MODEL = "gemini-4-neon"                   # Gemini CLI 0.68 has no option for the thinking level
+AGY_MODEL = "gemini-4-neon"                      # the base id: agy refuses a suffixed id with another effort
+AGY_EFFORT = "xhigh"
 DEFAULTS = {"codex": (CODEX_MODEL, CODEX_EFFORT), "deepseek": (DEEPSEEK_MODEL, DEEPSEEK_EFFORT),
-            "grok": (GROK_MODEL, GROK_EFFORT), "gemini": (GEMINI_MODEL, None)}
+            "grok": (GROK_MODEL, GROK_EFFORT), "gemini": (GEMINI_MODEL, None), "agy": (AGY_MODEL, AGY_EFFORT)}
 CLI_BIN = {"codex": "codex", "deepseek": os.path.join(HOME, ".opencode", "bin", "opencode"),
-           "grok": "cursor-agent", "gemini": "gemini"}
+           "grok": "cursor-agent", "gemini": "gemini", "agy": "agy"}
 # how the effort reaches the model: a flag of its own, a suffix of the model id, or the CLI's own choice
-EFFORT_SOURCE = {"codex": "flag", "deepseek": "model-id", "grok": "model-id", "gemini": "cli-default"}
-GROK_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # suffixes that end a cursor-agent model id
+EFFORT_SOURCE = {"codex": "flag", "deepseek": "model-id", "grok": "model-id", "gemini": "cli-default",
+                 "agy": "flag"}
+GROK_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # suffixes that end a cursor-agent or agy model id
+# agy's own rules, a second layer under the guard hook: they still hold if the hook does not load
+AGY_DENY = {"permissions": {"deny": ["write_file(*)", "command(*)", "read_url(*)", "execute_url(*)", "mcp(*)"]}}
+AGY_HOOKS_LOADED = "loaded 1 named hooks"         # agy's log line once the guard's hooks.json is read
+AGY_LOG = "agy.log"                               # in the private home: it names the account's email
 # A --models entry is provider[:model][@effort]. The effort lands inside a TOML string for Codex
 # and the model in argv, so both are kept to plain characters; a leading '-' would read as an option.
 MODEL_RE = r"[A-Za-z0-9][A-Za-z0-9._/#:+-]{0,79}"
@@ -109,21 +118,31 @@ ATTACH_DIR = "_poll_attachments"
 SKIP_DIRS_NONGIT = {"node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                     ".pytest_cache", ".tox", ".idea", ".DS_Store"}
 
-# Sandbox for DeepSeek and Grok: what they may write, and what they may read
+# Sandbox for DeepSeek, Grok and agy: what they may write, and what they may read
 # under /Users, /Volumes, /private/tmp and /private/var/folders (all denied by default).
 WRITE_DIRS = {
     # opencode keeps its sign-in inside its data folder, next to its session history,
-    # so DeepSeek shares the real one (see NOTES.md); Grok runs with a home folder of its own.
+    # so DeepSeek shares the real one (see NOTES.md); Grok and agy run with a home folder of their own.
     "deepseek": [".local/share/opencode", ".local/state/opencode", ".cache/opencode"],
     "grok": [],
+    "agy": [],
 }
 READ_DIRS = {
     "deepseek": [".local/share/opencode", ".local/state/opencode", ".cache/opencode",
                  ".config/opencode", ".opencode"],
     # cursor-agent finds its sign-in in the login keychain and says "Not logged in" without that file
     "grok": [".local/share/cursor-agent", "Library/Keychains/login.keychain-db"],
+    # agy is one file in ~/.local/bin (a tool folder); it signs in through the login keychain
+    "agy": ["Library/Keychains/login.keychain-db"],
 }
-PRIVATE_HOME = {"grok"}                      # models started with HOME set to <poll>/<model>/home
+PRIVATE_HOME = {"grok", "agy"}               # models started with HOME set to <poll>/<model>/home
+# agy writes a refreshed sign-in token here in plain text when the sandbox keeps it from the keychain
+AGY_TOKEN_FILE = os.path.join(".gemini", "antigravity-cli", "antigravity-oauth-token")
+# The guard hook and the folders above it: nothing inside the sandbox may replace or move them. agy
+# also moves a hooks.json found in its data folder over the one in config when it starts.
+AGY_CONF = os.path.join(".gemini", "config")
+AGY_FIXED = [".gemini", AGY_CONF, os.path.join(AGY_CONF, "hooks.json"), os.path.join(AGY_CONF, "poll_guard.py"),
+             os.path.join(".gemini", "antigravity-cli", "hooks.json")]
 # With its key in the keychain DeepSeek needs nothing from opencode's real data folder:
 # its data, state and cache then live in <poll>/deepseek/home (see child_env).
 DEEPSEEK_ISOLATED_READ = [".config/opencode", ".opencode"]
@@ -151,6 +170,9 @@ RULES ADDED BY THE POLL RUNNER
 FOOTER_RO = """- You can only read. Do not try to change files or run commands; say what you
   could not check because of that.
 """
+FOOTER_AGY = """- You have no tool to list or search files; read a file by its path. Every file
+  of this copy is listed in %s/FILES.txt: read that first.
+""" % ATTACH_DIR
 FOOTER_CODEX_RO = """- This is a read-only review. You may use read-only shell commands (cat, rg,
   ls, git status and the like) to inspect files in this copy. Do not modify
   files and do not execute project code, tests, builds, installers or servers;
@@ -171,7 +193,44 @@ ACCESS = {
     ("grok", False): "macOS sandbox with a home folder of its own: writes only that and its temp folder (not its copy); under /Users and the temp areas reads only its copy, the cursor-agent program, tool folders and the encrypted login keychain file (needed for sign-in); it can still start processes; network open.",
     ("gemini", False): "Gemini CLI sandbox, plan mode, allow-list policy: read tools and web search only; reads its copy, ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
     ("gemini", True): "Gemini CLI sandbox, auto-approved tools: writes and runs commands in its copy; reads ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
+    ("agy", False): "macOS sandbox with a home folder of its own; a guard hook lets the model only read files inside its copy and search the web (the search runs on Google's side), and agy's rules also deny writes, commands, URL fetches and MCP calls; the sandbox lets it write only that home and its temp folder (not its copy) and, under /Users and the temp areas, read only its copy, tool folders and the encrypted login keychain file (needed for its sign-in); network open; signed in with the user's Google account (plan quota, no API key); GEMINI.md, AGENTS.md and .agents/skills inside the copy are loaded as instructions; a command run inside this sandbox could read keychain items through /usr/bin/security, which is why commands are denied twice.",
 }
+
+# The PreToolUse hook agy runs before every tool call of the model (written into the private home
+# by new). Anything unexpected denies: agy also refuses the call when the hook fails or is slow.
+AGY_GUARD = '''import json, os, sys
+COPY = %r
+NO = "read-only reviewer: only read_file inside the review copy and search_web are available"
+
+
+def decide():
+    try:
+        d = json.loads(sys.stdin.read())
+        call = d["toolCall"]
+        name = call["name"]
+        if name == "search_web":
+            return "allow", "search_web is allowed"
+        if name == "read_file":
+            path = call["args"]["Path"]
+            if not isinstance(path, str) or not path:
+                return "deny", NO
+            if not os.path.isabs(path):
+                cwd = d["cwd"]
+                if not isinstance(cwd, str) or not os.path.isabs(cwd):
+                    return "deny", NO
+                path = os.path.join(cwd, path)
+            real = os.path.realpath(path)
+            if real == COPY or real.startswith(COPY + os.sep):
+                return "allow", "inside the review copy"
+            return "deny", NO + "; this path is outside the review copy"
+        return "deny", NO
+    except BaseException:
+        return "deny", NO
+
+
+decision, reason = decide()
+sys.stdout.write(json.dumps({"decision": decision, "reason": reason}) + "\\n")
+'''
 
 
 def die(msg, code=1):
@@ -426,6 +485,12 @@ def parents(path):
     return out[::-1]
 
 
+def sb_regex(path):
+    """path as a sandbox regex matching itself: every character special in a regex, or in the
+    profile's string, escaped (a variant slot's folder has a '+' in its name)."""
+    return re.sub(r'([.^$*+?()\[\]{}|\\"])', r"\\\1", path)
+
+
 def sandbox_profile(model, copy, tmp, home_dir=None):
     q = lambda p: '"%s"' % p.replace("\\", "\\\\").replace('"', '\\"')
     home = lambda rels: [os.path.join(HOME, r) for r in rels]
@@ -437,6 +502,9 @@ def sandbox_profile(model, copy, tmp, home_dir=None):
     readable = [copy] + own + home(DEEPSEEK_ISOLATED_READ if isolated_ds else READ_DIRS[model]) + home(TOOL_DIRS)
     lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
     lines += ["(allow file-write* (subpath %s))" % q(p) for p in writable]
+    if model == "agy" and home_dir:                      # later rules win: no plain-text token in its home,
+        lines.append('(deny file-write* (regex #"^%s"))' % sb_regex(os.path.join(home_dir, AGY_TOKEN_FILE)))
+        lines += ["(deny file-write* (literal %s))" % q(os.path.join(home_dir, r)) for r in AGY_FIXED]   # no new guard
     lines += ["(deny file-read* (subpath %s))" % q(p)
               for p in ("/Users", "/Volumes", "/private/tmp", "/private/var/folders")]
     # folders above the readable ones may be resolved (stat), never listed
@@ -444,6 +512,50 @@ def sandbox_profile(model, copy, tmp, home_dir=None):
     lines += ["(allow file-read-metadata (literal %s))" % q(p) for p in above]
     lines += ["(allow file-read* (subpath %s))" % q(p) for p in readable]
     return "\n".join(lines) + "\n"
+
+
+def guard_python():
+    """The interpreter for agy's guard hook: this one, unless the sandbox could not read it."""
+    exe = os.path.realpath(sys.executable)
+    if inside(exe, "/Users") and not any(inside(exe, os.path.realpath(os.path.join(HOME, t))) for t in TOOL_DIRS):
+        return "/usr/bin/python3"
+    return exe
+
+
+def agy_home(home_dir, copy):
+    """The guard hook in agy's private home: a script that allows only reads inside the copy and web search."""
+    conf = os.path.join(home_dir, AGY_CONF)
+    os.makedirs(conf)
+    guard = os.path.join(conf, "poll_guard.py")
+    with open(guard, "w") as f:
+        f.write(AGY_GUARD % os.path.realpath(copy))
+    command = "%s -I %s" % (shlex.quote(guard_python()), shlex.quote(guard))
+    hooks = {"poll-guard": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command,
+                                                                        "timeout": 10}]}]}}
+    with open(os.path.join(conf, "hooks.json"), "w") as f:
+        f.write(json.dumps(hooks, indent=1) + "\n")
+
+
+def agy_copy(m, copy):
+    """Prepare agy's copy: switch off the workspace hooks and MCP servers agy would start without asking,
+    and list the files, since the model has no tool to list a folder. Returns note lines."""
+    notes = []
+    for folder in (".agents", ".agent", "_agents", "_agent"):
+        for name in ("hooks.json", "mcp_config.json"):
+            path = os.path.join(copy, folder, name)
+            if os.path.lexists(path):
+                os.rename(path, path + ".poll-disabled")
+                notes.append("%s: renamed %s/%s to %s.poll-disabled in its copy, because agy would run the "
+                             "commands it names without asking" % (m, folder, name, name))
+    files = []
+    for root, dirs, names in os.walk(copy):              # links are listed, never followed
+        dirs[:] = [x for x in dirs if not (root == copy and x == ".git")]
+        names += [x for x in dirs if os.path.islink(os.path.join(root, x))]
+        files += [os.path.relpath(os.path.join(root, x), copy) for x in names]
+    os.makedirs(os.path.join(copy, ATTACH_DIR), exist_ok=True)
+    with open(os.path.join(copy, ATTACH_DIR, "FILES.txt"), "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write("".join(x + "\n" for x in sorted(files)))
+    return notes
 
 
 def data_dirs():
@@ -507,22 +619,26 @@ def cmd_new(a):
             f.write("\n# not copied: submodules or nested repositories (%d)\n%s\n" % (len(rep["nested"]), "\n".join(rep["nested"])))
             f.write("\n# skipped standard folders, plain copies only (%d)\n%s\n" % (len(rep["skipped"]), "\n".join(rep["skipped"])))
             f.write("\n# notes\n%s\n" % "\n".join(rep["notes"]))
-        own_data = []
+        own_data, slot_notes = [], []
         for m in models:
             d = os.path.join(root, m)
             p = info[m]["provider"]
             os.makedirs(os.path.join(d, "tmp"))
             shutil.copytree(master, os.path.join(d, "copy"), symlinks=True)
+            if p == "agy":
+                slot_notes += agy_copy(m, os.path.join(d, "copy"))
             can_run = m in run or p == "deepseek"
             with open(os.path.join(d, "brief.txt"), "w", encoding="utf-8") as f:
                 footer = FOOTER_RUN if can_run else (FOOTER_CODEX_RO if p == "codex" else FOOTER_RO)
-                f.write(brief.rstrip("\n") + "\n" + FOOTER_COMMON + footer)
+                f.write(brief.rstrip("\n") + "\n" + FOOTER_COMMON + footer + (FOOTER_AGY if p == "agy" else ""))
             home_dir = None
             if p in PRIVATE_HOME:                        # a home of its own, with only the keychain linked in
                 home_dir = os.path.join(d, "home")
                 os.makedirs(os.path.join(home_dir, "Library"))
                 os.symlink(os.path.join(HOME, "Library", "Keychains"),
                            os.path.join(home_dir, "Library", "Keychains"))
+                if p == "agy":
+                    agy_home(home_dir, os.path.join(d, "copy"))
             elif p == "deepseek" and deepseek_isolated:  # data folders of its own; HOME stays, for its config
                 home_dir = os.path.join(d, "home")
                 os.makedirs(home_dir)
@@ -546,7 +662,7 @@ def cmd_new(a):
     print("poll: %s (kind: %s)" % (root, a.kind))
     print("copy: %s, %d files, %.1f MB; full list in %s" % (rep["mode"], rep["files"], rep["bytes"] / 2 ** 20,
                                                            os.path.join(root, "manifest.txt")))
-    for note in rep["notes"]:
+    for note in rep["notes"] + slot_notes:
         print("note: " + note)
     if rep["secrets"]:
         print("left out, names that look like secrets (%d): %s%s" % (
@@ -602,6 +718,8 @@ def child_env(model, d=None, own_data=False):
         # (denied) once that path passes 83 characters; a path relative to its working
         # directory, the copy, keeps it in the private home however long the poll path is
         env["CURSOR_DATA_DIR"] = os.path.join(os.pardir, "home", ".cursor")
+    if model == "agy":
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"       # only the word true works; "1" does not
     if model == "gemini":
         key = os.environ.get("GEMINI_API_KEY") or keychain_value(KEYCHAIN["gemini"][0])
         if not key:
@@ -621,10 +739,10 @@ def model_arg(provider, model, effort):
 
 
 def split_model(provider, s):
-    """(model, effort) of a model string as its CLI takes it: DeepSeek 'id#effort', Grok 'id-effort'."""
+    """(model, effort) of a model string as its CLI takes it: DeepSeek 'id#effort', Grok and agy 'id-effort'."""
     if provider == "deepseek" and "#" in s:
         return tuple(s.rsplit("#", 1))
-    m = re.fullmatch(r"(.+)-(%s)" % "|".join(GROK_EFFORTS), s) if provider == "grok" else None
+    m = re.fullmatch(r"(.+)-(%s)" % "|".join(GROK_EFFORTS), s) if provider in ("grok", "agy") else None
     return (m.group(1), m.group(2)) if m else (s, None)
 
 
@@ -694,6 +812,15 @@ def child_argv(info, d, pid, run, brief, policy):
         return ["sandbox-exec", "-f", os.path.join(d, "profile.sb"), CLI_BIN[model], "-p", "--trust",
                 "--mode", "ask", "--model", model_arg(model, name, effort), "--output-format", "stream-json",
                 "--workspace", copy, brief]
+    if model == "agy":
+        # The guard hook in the private home decides what runs; the deny rules are a second layer
+        # that still holds if the guard does not load; the outer profile is the limit on disk. No
+        # skip-permissions and no mode: a prompt would be denied and end the turn. The log goes into
+        # the private home because it names the account's email, and clean deletes home.
+        return (["sandbox-exec", "-f", os.path.join(d, "profile.sb"), CLI_BIN[model], "-p", brief,
+                 "--output-format", "stream-json", "--model", name] + (["--effort", effort] if effort else [])
+                + ["--disable-slash-commands", "--settings", json.dumps(AGY_DENY),
+                   "--log-file", os.path.join(d, "home", AGY_LOG)])
     mode = ["--approval-mode", "yolo"] if run else ["--approval-mode", "plan", "--policy", policy]
     return [CLI_BIN[model], "--skip-trust"] + mode + ["-s", "-m", name, "-o", "stream-json", "-p", brief]
 
@@ -910,6 +1037,12 @@ def cmd_launch(a):
             if now - looked > 2:
                 looked = now
                 note_family()
+                if p == "agy" and not flags["policy_error"]:
+                    bad = agy_hooks_problem(d)
+                    if bad:                              # the guard is not in force: stop it now
+                        sys.stderr.write("\n[poll] %s: %s; stopping the run\n" % (m, bad))
+                        flags["policy_error"] = True
+                        flags["stop"] = True
             if flags["stop"]:
                 asked = asked or now
                 want = (signal.SIGKILL if flags["policy_error"] or now - asked > 16
@@ -944,6 +1077,8 @@ def cmd_launch(a):
                 os.remove(policy)
             except OSError:
                 pass
+        if p == "agy":
+            agy_drop_tokens(d)
         with open(os.path.join(d, "exit"), "w") as f:
             f.write(result + "\n")
         finish_record(d, p)                              # after exit: the record reads the result from it
@@ -1032,6 +1167,54 @@ def events(path):
     return out
 
 
+def agy_events(path):
+    """agy's stream: one JSON object per line, keyed by "event" (init, step_update, result), not "type"."""
+    out = []
+    for line in read(path).splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("event"), str):
+            out.append(obj)
+    return out
+
+
+def agy_steps(ev):
+    return [e["step_update"] for e in ev if e.get("event") == "step_update" and isinstance(e.get("step_update"), dict)]
+
+
+def agy_result(ev):
+    """The result object of agy's last result event, or None."""
+    res = [e.get("result") for e in ev if e.get("event") == "result"]
+    return res[-1] if res and isinstance(res[-1], dict) else None
+
+
+def agy_hooks_problem(d):
+    """Why agy's log shows the guard hook is not in force, or "" (also while the log says nothing yet)."""
+    log = read(os.path.join(d, "home", AGY_LOG))
+    if re.search(r"Failed to load JSON config file \S*hooks\.json", log):
+        return "agy could not read the guard's hooks.json"
+    other = [n for n in re.findall(r"loaded (\d+) named hooks", log) if n != "1"]
+    if other:
+        return "agy loaded %s hooks instead of the guard alone" % other[0]
+    return ""
+
+
+def agy_drop_tokens(d):
+    """Delete any sign-in token file agy left in its private home. The profile should make this a no-op."""
+    base = os.path.join(d, "home", ".gemini", "antigravity-cli")
+    for root, dirs, names in os.walk(base):
+        for name in names:
+            if "token" in name.lower():
+                try:
+                    os.remove(os.path.join(root, name))
+                    sys.stderr.write("[poll] deleted a token file agy left in its home: %s\n"
+                                     % os.path.relpath(os.path.join(root, name), d))
+                except OSError as e:
+                    sys.stderr.write("[poll] could not delete %s: %s\n" % (os.path.join(root, name), e))
+
+
 def pid_info(d):
     """The launcher's record: always its own pid, the model's once it was started."""
     try:
@@ -1100,6 +1283,37 @@ def cut(text):
     return before, "", "last"
 
 
+def agy_final(d):
+    """(text, problem) of an agy run, judged by the stream's structure, never by its words. The text
+    of a run with a problem is kept too, as evidence."""
+    ev = agy_events(os.path.join(d, "log"))
+    res = agy_result(ev)
+    if res is None:
+        return "", "no result event: the run did not finish"
+    turn = []                                            # assistant text since the last tool step
+    for s in agy_steps(ev):
+        if s.get("step_type") == "tool":
+            turn = []
+        elif s.get("step_type") == "agent_response" and isinstance(s.get("text_delta"), str):
+            turn.append(s["text_delta"])
+    final, whole = "".join(turn), str(res.get("response") or "")
+    text = final if MARKER_RE.search(final) or not whole.strip() else whole
+    problems = []
+    if res.get("status") != "SUCCESS" or "error" in res or "finished_reason" in res:
+        problems.append("the CLI reported status %s, error %s, finished_reason %s" % (
+            res.get("status"), str(res.get("error"))[:200], res.get("finished_reason")))
+    if res.get("denied_actions"):
+        problems.append("a tool needed a permission a headless run cannot ask for: %s"
+                        % json.dumps(res["denied_actions"])[:300])
+    log = os.path.join(d, "home", AGY_LOG)
+    if os.path.exists(log):                              # a log deleted by clean is not judged
+        bad = agy_hooks_problem(d) or ("" if AGY_HOOKS_LOADED in read(log) else
+                                       "agy's log does not show the guard hook loaded (%r missing)" % AGY_HOOKS_LOADED)
+        if bad:
+            problems.append(bad)
+    return text, "; ".join(problems)
+
+
 def final_text(model, d):
     """(text, problem): the final message of a finished run, or why there is none."""
     if model == "codex":
@@ -1124,6 +1338,8 @@ def final_text(model, d):
         final, whole = "".join(turn), str(last.get("result") or "")
         # the last turn is the clean answer when it carries the marker; otherwise trust the CLI's result
         return (final if MARKER_RE.search(final) or not whole.strip() else whole), ""
+    if model == "agy":
+        return agy_final(d)
     if model == "gemini":
         res = [e for e in ev if e.get("type") == "result"]
         if not res:
@@ -1275,9 +1491,12 @@ def run_base(meta, m, info):
             "poll": meta.get("id"), "poll_kind": meta.get("kind"), "inferred": False}
 
 
-def failure_text(d):
+def failure_text(d, model=None):
     """Where a failed run says why: the end of its stderr and the error events of its log."""
     parts = [ANSI_RE.sub("", tail(os.path.join(d, "err"), 3000))]
+    res = agy_result(agy_events(os.path.join(d, "log"))) if model == "agy" else None
+    if res and res.get("status") != "SUCCESS":
+        parts.append(json.dumps({k: res.get(k) for k in ("status", "error", "finished_reason")})[:2000])
     for e in events(os.path.join(d, "log")):
         if (e.get("type") == "error" or e.get("is_error")
                 or e.get("type") == "result" and e.get("status") not in (None, "success")):
@@ -1302,7 +1521,7 @@ def outcome(model, d, st, code):
         return "failed", "crashed_after_answer", None
     if code == "policy-error":
         return "failed", "sandbox", None
-    blob = failure_text(d)
+    blob = failure_text(d, model)
     return "failed", next((c for c, rx in FAILURES if rx.search(blob)), "other"), None
 
 
@@ -1333,6 +1552,11 @@ def observe(model, d):
            "status": status, "failure": failure, "answer": kind}
     if st != "not started":
         rec.update(usage_figures(model, d))
+    if model == "agy":                                   # to find the run in agy's own history
+        ev = agy_events(os.path.join(d, "log"))
+        ids = [e.get("conversation_id") for e in ev if e.get("event") == "init"]
+        ids += [(agy_result(ev) or {}).get("conversation_id")]
+        rec["conversation"] = next((i for i in ids if isinstance(i, str) and i), None)
     return rec
 
 
@@ -1357,6 +1581,19 @@ def last_step(model, d):
     if model == "codex":                                 # codex writes its trace to stderr
         lines = [l for l in ANSI_RE.sub("", read(os.path.join(d, "err"))[-4000:]).splitlines() if l.strip()]
         return lines[-1][:100] if lines else ""
+    if model == "agy":
+        ev = agy_events(os.path.join(d, "log"))
+        if not ev:
+            return ""
+        e = ev[-1]
+        if e.get("event") == "result" and isinstance(e.get("result"), dict):
+            r = e["result"]
+            return " ".join(str(x) for x in ("result", r.get("status"), r.get("finished_reason")) if x)
+        s = e.get("step_update") if isinstance(e.get("step_update"), dict) else {}
+        if s.get("step_type") == "tool":
+            return ("tool %s %s" % (s.get("tool_name") or "", "" if s.get("state") in ("ACTIVE", "DONE")
+                                    else s.get("state") or "")).strip()
+        return str(s.get("step_type") or e.get("event"))
     ev = events(os.path.join(d, "log"))
     if not ev:
         return ""
@@ -1597,7 +1834,29 @@ def usage_deepseek(d):
                 usd, "per token", note)]
 
 
-USAGE = {"codex": usage_codex, "deepseek": usage_deepseek, "grok": usage_grok, "gemini": usage_gemini}
+def usage_agy(d):
+    ev = agy_events(os.path.join(d, "log"))
+    # on a resumed conversation result.usage is cumulative, so the sum of this log's steps is this run
+    us = [s["usage"] for s in agy_steps(ev) if s.get("step_type") == "agent_response"
+          and s.get("state") == "DONE" and isinstance(s.get("usage"), dict)]
+    if not us:
+        u = (agy_result(ev) or {}).get("usage")
+        us = [u] if isinstance(u, dict) else []
+    note = "input excludes cached tokens (inferred, not documented); reasoning is part of output"
+    log = read(os.path.join(d, "home", AGY_LOG))
+    if "authenticated via gemini_api_key" in log:
+        note += "; this run was billed to an API key, not the plan"
+    elif "authenticated via keyring" in log:
+        note += "; signed in through the keychain (the account's plan)"
+    if not us:
+        return [row("agy", billing="Google AI plan", note="no usage in the log")]
+    return [row("agy", total(num(u.get("input_tokens")) for u in us), total(num(u.get("cache_read_tokens")) for u in us),
+                total(num(u.get("output_tokens")) for u in us), total(num(u.get("thinking_tokens")) for u in us),
+                None, "Google AI plan", note)]
+
+
+USAGE = {"codex": usage_codex, "deepseek": usage_deepseek, "grok": usage_grok, "gemini": usage_gemini,
+         "agy": usage_agy}
 
 
 def cell(v):
@@ -1648,7 +1907,7 @@ def cmd_usage(a):
         if partial:
             line += " %d run(s) did not finish cleanly, so their figure may be low." % partial
         print("\n" + line + " This is not the providers' invoice.")
-    print("\"input\" excludes cached tokens for Codex, DeepSeek and Gemini; for Grok see its note. "
+    print("\"input\" excludes cached tokens for Codex, DeepSeek, Gemini and agy; for Grok see its note. "
           "Models on a plan show tokens only. The coordinating agent's own tokens are not counted.")
 
 
@@ -1668,7 +1927,8 @@ def main():
     p = sub.add_parser("new")
     p.add_argument("--src", required=True)
     p.add_argument("--brief", required=True)
-    p.add_argument("--models", default="codex,grok")
+    p.add_argument("--models", default="codex,grok",
+                   help="comma list of provider[:model][@effort]; providers: %s" % ", ".join(ALL_MODELS))
     p.add_argument("--run", default="")
     p.add_argument("--topic", default="")
     p.add_argument("--kind", choices=KINDS, default="other", help="what is reviewed, for the statistics")

@@ -444,7 +444,7 @@ def cmd_stats(a):
 
 # The model strings in force after each commit of the skill: poll.py's constants, or the command
 # lines of the first SKILL.md, from before poll.py existed.
-CONST_RE = re.compile(r'^\+(CODEX|DEEPSEEK|GROK|GEMINI)_(MODEL|EFFORT)\s*=\s*"([^"]+)"')
+CONST_RE = re.compile(r'^\+(CODEX|DEEPSEEK|GROK|GEMINI|AGY)_(MODEL|EFFORT)\s*=\s*"([^"]+)"')
 SKILL_CMD_RE = [
     ("codex", "MODEL", re.compile(r"\bcodex exec\b.*?\s-m\s+([\w.\-/#]+)")),
     ("codex", "EFFORT", re.compile(r'model_reasoning_effort="?(\w+)')),
@@ -593,7 +593,7 @@ def codex_evidence(pid, m, d, t):
 
 
 def log_model(d):
-    """(model, cursor-agent?) the CLI announced in its first event: Gemini CLI gives the id,
+    """(model, cursor-agent?) the CLI announced in its first event: Gemini CLI and agy give the id,
     cursor-agent a display name such as 'Grok 4.7 256K High'."""
     for line in head(os.path.join(d, "log")).splitlines()[:5]:
         try:
@@ -602,6 +602,9 @@ def log_model(d):
             continue
         if isinstance(e, dict) and e.get("type") in ("init", "system") and isinstance(e.get("model"), str):
             return e["model"], e.get("type") == "system"
+        init = e.get("init") if isinstance(e, dict) and e.get("event") == "init" else None
+        if isinstance(init, dict) and isinstance(init.get("model"), str):   # agy echoes its --model here
+            return init["model"], False
     return None, False
 
 
@@ -625,7 +628,7 @@ def infer(root, meta, m, d):
     model, effort, version, source = info["model"], info["effort"], None, "poll.json" if info["model"] else None
     effort_source, cli = P.EFFORT_SOURCE[p], os.path.basename(P.CLI_BIN[p])
     shown, via_cursor = log_model(d)
-    if not source and os.path.exists(os.path.join(d, "run.sh")):
+    if not source and p in RUNSH_RE and os.path.exists(os.path.join(d, "run.sh")):
         text = P.read(os.path.join(d, "run.sh"))
         rx_model, rx_effort = RUNSH_RE[p]
         hit = rx_model.search(text)
