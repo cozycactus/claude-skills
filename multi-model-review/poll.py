@@ -144,7 +144,8 @@ AGY_TOKEN_FILE = os.path.join(".gemini", "antigravity-cli", "antigravity-oauth-t
 # also moves a hooks.json found in its data folder over the one in config when it starts.
 AGY_CONF = os.path.join(".gemini", "config")
 AGY_FIXED = [".gemini", AGY_CONF, os.path.join(AGY_CONF, "hooks.json"), os.path.join(AGY_CONF, "poll_guard.py"),
-             os.path.join(".gemini", "antigravity-cli", "hooks.json")]
+             os.path.join(".gemini", "antigravity-cli", "hooks.json"), os.path.join(".gemini", "hooks.json"),
+             os.path.join(".gemini", "antigravity-cli", "settings.json")]
 # With its key in the keychain DeepSeek needs nothing from opencode's real data folder:
 # its data, state and cache then live in <poll>/deepseek/home (see child_env).
 DEEPSEEK_ISOLATED_READ = [".config/opencode", ".opencode"]
@@ -205,14 +206,19 @@ ACCESS = {
     ("grok", False): "macOS sandbox with a home folder of its own: writes only that and its temp folder (not its copy); under /Users and the temp areas reads only its copy, the cursor-agent program, tool folders and the encrypted login keychain file (needed for sign-in); it can still start processes; network open.",
     ("gemini", False): "Gemini CLI sandbox, plan mode, allow-list policy: read tools and web search only; reads its copy, ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
     ("gemini", True): "Gemini CLI sandbox, auto-approved tools: writes and runs commands in its copy; reads ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
-    ("agy", False): "macOS sandbox with a home folder of its own; a guard hook lets the model only read files inside its copy and search the web (the search runs on Google's side), and agy's rules also deny writes, commands, URL fetches and MCP calls; the sandbox lets it write only that home and its temp folder (not its copy) and, under /Users and the temp areas, read only its copy, tool folders and the encrypted login keychain file (needed for its sign-in); network open; signed in with the user's Google account (plan quota, no API key); GEMINI.md, AGENTS.md and .agents/skills inside the copy are loaded as instructions; a command run inside this sandbox could read keychain items through /usr/bin/security, which is why commands are denied twice.",
+    ("agy", False): "macOS sandbox with a home folder of its own; a guard hook lets the model only read files inside its copy and search the web (the search runs on Google's side), and agy's rules also deny writes, commands, URL fetches and MCP calls; the sandbox lets it write only that home and its temp folder (not its copy) and, under /Users and the temp areas, read only its copy, its own home, tool folders and the encrypted login keychain file (needed for its sign-in); network open; signed in with the user's Google account (plan quota, no API key); GEMINI.md, AGENTS.md and .agents/skills inside the copy are loaded as instructions; a command run inside this sandbox could read keychain items through /usr/bin/security, which is why commands are denied twice.",
 }
 
 # The PreToolUse hook agy runs before every tool call of the model (written into the private home
 # by new). Anything unexpected denies: agy also refuses the call when the hook fails or is slow.
 AGY_GUARD = '''import json, os, sys
-COPY = %r
+COPY = %r          # the copy's real path
+GIVEN = %r         # the copy as agy is given it for its working directory
 NO = "read-only reviewer: only read_file inside the review copy and search_web are available"
+
+
+def under(path, root):
+    return path == root or path.startswith(root + os.sep)
 
 
 def decide():
@@ -226,13 +232,17 @@ def decide():
             path = call["args"]["Path"]
             if not isinstance(path, str) or not path:
                 return "deny", NO
+            # spellings agy's own file tool might expand or clean up differently from this script
+            if path != path.strip() or path[0] in "~$" or "://" in path or "\\0" in path:
+                return "deny", NO + "; this path form is not accepted"
             if not os.path.isabs(path):
                 cwd = d["cwd"]
-                if not isinstance(cwd, str) or not os.path.isabs(cwd):
+                if not isinstance(cwd, str) or not os.path.isabs(cwd) or "\\0" in cwd:
                     return "deny", NO
                 path = os.path.join(cwd, path)
+            plain = os.path.normpath(path)               # '..' taken lexically, links not resolved
             real = os.path.realpath(path)
-            if real == COPY or real.startswith(COPY + os.sep):
+            if (under(plain, COPY) or under(plain, GIVEN)) and under(real, COPY):
                 return "allow", "inside the review copy"
             return "deny", NO + "; this path is outside the review copy"
         return "deny", NO
@@ -517,6 +527,9 @@ def sandbox_profile(model, copy, tmp, home_dir=None):
     if model == "agy" and home_dir:                      # later rules win: no plain-text token in its home,
         lines.append('(deny file-write* (regex #"^%s"))' % sb_regex(os.path.join(home_dir, AGY_TOKEN_FILE)))
         lines += ["(deny file-write* (literal %s))" % q(os.path.join(home_dir, r)) for r in AGY_FIXED]   # no new guard
+        # the home itself and the token's folder: neither may be moved away and replaced by a link
+        lines += ["(deny file-write* (literal %s))" % q(p)
+                  for p in (home_dir, os.path.join(home_dir, os.path.dirname(AGY_TOKEN_FILE)))]
     lines += ["(deny file-read* (subpath %s))" % q(p)
               for p in ("/Users", "/Volumes", "/private/tmp", "/private/var/folders")]
     # folders above the readable ones may be resolved (stat), never listed
@@ -529,7 +542,9 @@ def sandbox_profile(model, copy, tmp, home_dir=None):
 def guard_python():
     """The interpreter for agy's guard hook: this one, unless the sandbox could not read it."""
     exe = os.path.realpath(sys.executable)
-    if inside(exe, "/Users") and not any(inside(exe, os.path.realpath(os.path.join(HOME, t))) for t in TOOL_DIRS):
+    # the areas the profile denies, and the tool folders it opens, spelled as sandbox_profile writes them
+    if (any(inside(exe, a) for a in ("/Users", "/Volumes", "/private/tmp", "/private/var/folders"))
+            and not any(inside(exe, os.path.join(HOME, t)) for t in TOOL_DIRS)):
         return "/usr/bin/python3"
     return exe
 
@@ -538,9 +553,10 @@ def agy_home(home_dir, copy):
     """The guard hook in agy's private home: a script that allows only reads inside the copy and web search."""
     conf = os.path.join(home_dir, AGY_CONF)
     os.makedirs(conf)
+    os.makedirs(os.path.join(home_dir, os.path.dirname(AGY_TOKEN_FILE)))   # made here: the profile fixes it
     guard = os.path.join(conf, "poll_guard.py")
     with open(guard, "w") as f:
-        f.write(AGY_GUARD % os.path.realpath(copy))
+        f.write(AGY_GUARD % (os.path.realpath(copy), os.path.abspath(copy)))
     command = "%s -I %s" % (shlex.quote(guard_python()), shlex.quote(guard))
     hooks = {"poll-guard": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command,
                                                                         "timeout": 10}]}]}}
@@ -565,6 +581,8 @@ def agy_copy(m, copy):
         names += [x for x in dirs if os.path.islink(os.path.join(root, x))]
         files += [os.path.relpath(os.path.join(root, x), copy) for x in names]
     os.makedirs(os.path.join(copy, ATTACH_DIR), exist_ok=True)
+    if os.path.lexists(os.path.join(copy, ATTACH_DIR, "FILES.txt")):
+        die("an attachment is named FILES.txt, the name of agy's file list in %s/; rename it" % ATTACH_DIR)
     with open(os.path.join(copy, ATTACH_DIR, "FILES.txt"), "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write("".join(x + "\n" for x in sorted(files)))
     return notes
@@ -660,6 +678,9 @@ def cmd_new(a):
                 with open(os.path.join(d, "profile.sb"), "w") as f:
                     f.write(sandbox_profile(p, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir))
         shutil.rmtree(master)
+        if slot_notes:                                   # what was changed in a slot's own copy
+            with open(os.path.join(root, "manifest.txt"), "a", encoding="utf-8", errors="surrogateescape") as f:
+                f.write("\n# notes on the slots' copies\n%s\n" % "\n".join(slot_notes))
         meta = {"id": pid, "src": os.path.realpath(a.src), "models": models, "run": sorted(run),
                 "own_data": sorted(own_data), "slots": info, "kind": a.kind,
                 # how much there was to review, for the statistics
@@ -955,12 +976,21 @@ def cmd_launch(a):
     else:
         env["TMPDIR"] = os.path.join(d, "tmp") + os.sep
     rec = run_base(meta, m, info)                        # what is known before the model starts
-    rec.update(cli_version=cli_version(CLI_BIN[p], env, os.path.join(d, "copy")), status="running",
+    # agy's probe runs unsandboxed, so never inside the reviewed copy
+    rec.update(cli_version=cli_version(CLI_BIN[p], env, os.path.join(d, "tmp" if p == "agy" else "copy")), status="running",
                started=me["started"], started_iso=iso(me["started"]))
     try:
         write_run(d, rec)
     except OSError as e:                                 # a missing record must not stop the review
         sys.stderr.write("[poll] could not write %s: %s\n" % (RUN, e))
+    bad = agy_preflight(d, env) if p == "agy" else ""
+    if bad:                                              # the model is never started without a working guard
+        with open(os.path.join(d, "err"), "w") as f:
+            f.write("[poll] %s\n" % bad)
+        with open(os.path.join(d, "exit"), "w") as f:
+            f.write("policy-error\n")
+        finish_record(d, p)
+        die("%s: %s; the model was not started" % (m, bad), 95)
     brief = open(os.path.join(d, "brief.txt"), encoding="utf-8").read()
     policy = None
     if p == "gemini" and not run:
@@ -1066,10 +1096,10 @@ def cmd_launch(a):
                         os.killpg(proc.pid, want)
                     except OSError:
                         pass
-                    for p, birth in known.items():
-                        if same(p, birth):
+                    for pid, birth in known.items():
+                        if same(pid, birth):
                             try:
-                                os.kill(p, want)
+                                os.kill(pid, want)
                             except OSError:
                                 pass
         left = [(p, known.get(p, "")) for p in set(group_pids(proc.pid)) | set(known) if same(p, known.get(p, ""))]
@@ -1080,6 +1110,11 @@ def cmd_launch(a):
         for t in threads:
             t.join(timeout=10)
         result = ("policy-error" if flags["policy_error"] else "stopped" if flags["interrupted"] else str(code))
+        if p == "agy" and result == "0":                 # the verdict on the guard, once more, before it is written
+            bad = agy_guard_unshown(d)
+            if bad:
+                sys.stderr.write("\n[poll] %s: %s; the result is policy-error\n" % (m, bad))
+                result = "policy-error"
     finally:
         if result == "launcher-error":                   # something above failed: do not leave the model running
             kill_all([(proc.pid, "")] + list(known.items()), proc.pid, patience=3,
@@ -1206,7 +1241,7 @@ def agy_hooks_problem(d, path=None):
     """Why agy's log (the first run's, or path) shows the guard hook is not in force, or ""
     (also while the log says nothing yet)."""
     log = read(path or os.path.join(d, "home", AGY_LOG))
-    if re.search(r"Failed to load JSON config file \S*hooks\.json", log):
+    if re.search(r"Failed to load JSON config file [^\n]*hooks\.json", log):
         return "agy could not read the guard's hooks.json"
     other = [n for n in re.findall(r"loaded (\d+) named hooks", log) if n != "1"]
     if other:
@@ -1214,18 +1249,66 @@ def agy_hooks_problem(d, path=None):
     return ""
 
 
+def agy_preflight(d, env):
+    """Run the guard hook as agy would, under the slot's profile, on one read it must allow and one it must
+    deny. Returns why it does not work, naming the interpreter, or "". A guard that fails makes agy refuse
+    every tool, so the run would end with no review instead of an unguarded one; this says so up front."""
+    copy = os.path.join(d, "copy")
+    try:
+        hooks = json.loads(read(os.path.join(d, "home", AGY_CONF, "hooks.json")))
+        command = hooks["poll-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+        argv = shlex.split(command)
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        return "the guard's hooks.json cannot be read: %s: %s" % (type(e).__name__, e)
+    python = argv[0] if argv else "?"
+    for want, path in (("allow", os.path.join(copy, ATTACH_DIR, "FILES.txt")), ("deny", "/etc/hosts")):
+        call = json.dumps({"toolCall": {"name": "read_file", "args": {"Path": path}}, "cwd": copy})
+        with tempfile.TemporaryFile() as out:
+            try:
+                proc = subprocess.Popen(["sandbox-exec", "-f", os.path.join(d, "profile.sb")] + argv, env=env, cwd=copy,
+                                        stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as e:
+                return "the guard could not be started with %s: %s" % (python, e)
+            try:
+                proc.communicate(call.encode(), timeout=15)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+                return "the guard did not answer within 15 s under the profile with %s" % python
+            out.seek(0)
+            got = out.read(4096).decode("utf-8", "replace")
+        try:
+            decision = json.loads(got.strip().splitlines()[-1])["decision"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            decision = None
+        if decision != want:
+            return "the guard did not work under the profile with %s (exit %s, wanted %s, got %r)" % (
+                python, proc.returncode, want, ANSI_RE.sub("", got).strip()[-200:])
+    return ""
+
+
 def agy_drop_tokens(d):
     """Delete any sign-in token file agy left in its private home. The profile should make this a no-op."""
-    base = os.path.join(d, "home", ".gemini", "antigravity-cli")
-    for root, dirs, names in os.walk(base):
-        for name in names:
-            if "token" in name.lower():
-                try:
-                    os.remove(os.path.join(root, name))
-                    sys.stderr.write("[poll] deleted a token file agy left in its home: %s\n"
-                                     % os.path.relpath(os.path.join(root, name), d))
-                except OSError as e:
-                    sys.stderr.write("[poll] could not delete %s: %s\n" % (os.path.join(root, name), e))
+    # this runs outside the sandbox: never follow a link the model could have put on the way
+    home = os.path.join(d, "home")
+    base = os.path.join(home, os.path.dirname(AGY_TOKEN_FILE))
+    steps = (home, os.path.join(home, ".gemini"), base)
+    if (any(os.path.islink(p) or not os.path.isdir(p) for p in steps)
+            or not inside(os.path.realpath(base), os.path.realpath(home))):
+        sys.stderr.write("[poll] token files not looked for: %s is not a plain folder inside %s\n"
+                         % (os.path.relpath(base, d), os.path.relpath(home, d)))
+        return
+    for name in os.listdir(base):                        # the token file sits directly in it
+        path = os.path.join(base, name)
+        if "token" in name.lower() and (os.path.islink(path) or not os.path.isdir(path)):
+            try:
+                os.remove(path)                          # a link is removed as a link
+                sys.stderr.write("[poll] deleted a token file agy left in its home: %s\n" % os.path.relpath(path, d))
+            except OSError as e:
+                sys.stderr.write("[poll] could not delete %s: %s\n" % (path, e))
 
 
 def pid_info(d):
@@ -1301,30 +1384,38 @@ def agy_final(d, stream=None, log=None):
     of a run with a problem is kept too, as evidence. stream and log default to the first run's."""
     ev = agy_events(stream or os.path.join(d, "log"))
     res = agy_result(ev)
-    if res is None:
-        return "", "no result event: the run did not finish"
     turn = []                                            # assistant text since the last tool step
     for s in agy_steps(ev):
         if s.get("step_type") == "tool":
             turn = []
         elif s.get("step_type") == "agent_response" and isinstance(s.get("text_delta"), str):
             turn.append(s["text_delta"])
+    if res is None:                                      # a killed run's text is still evidence
+        return "".join(turn), "no result event: the run did not finish"
     final, whole = "".join(turn), str(res.get("response") or "")
     text = final if MARKER_RE.search(final) or not whole.strip() else whole
     problems = []
-    if res.get("status") != "SUCCESS" or "error" in res or "finished_reason" in res:
+    if res.get("status") != "SUCCESS" or res.get("error") or res.get("finished_reason"):
         problems.append("the CLI reported status %s, error %s, finished_reason %s" % (
             res.get("status"), str(res.get("error"))[:200], res.get("finished_reason")))
     if res.get("denied_actions"):
         problems.append("a tool needed a permission a headless run cannot ask for: %s"
                         % json.dumps(res["denied_actions"])[:300])
-    log = log or os.path.join(d, "home", AGY_LOG)
-    if os.path.exists(log):                              # a log deleted by clean is not judged
-        bad = agy_hooks_problem(d, log) or ("" if AGY_HOOKS_LOADED in read(log) else
-                                       "agy's log does not show the guard hook loaded (%r missing)" % AGY_HOOKS_LOADED)
-        if bad:
-            problems.append(bad)
+    bad = agy_guard_unshown(d, log)
+    if bad:
+        problems.append(bad)
     return text, "; ".join(problems)
+
+
+def agy_guard_unshown(d, log=None):
+    """Why agy's log (the first run's, or log) does not show the guard loaded, or "". Only a home
+    deleted by clean leaves a run unjudged; a home without its log is a problem."""
+    log = log or os.path.join(d, "home", AGY_LOG)
+    if not os.path.exists(log):
+        return "" if not os.path.isdir(os.path.join(d, "home")) else \
+            "agy wrote no log, so the guard cannot be shown loaded"
+    return agy_hooks_problem(d, log) or ("" if AGY_HOOKS_LOADED in read(log) else
+                                         "agy's log does not show the guard hook loaded (%r missing)" % AGY_HOOKS_LOADED)
 
 
 def final_text(model, d):
@@ -1508,7 +1599,7 @@ def failure_text(d, model=None):
     """Where a failed run says why: the end of its stderr and the error events of its log."""
     parts = [ANSI_RE.sub("", tail(os.path.join(d, "err"), 3000))]
     res = agy_result(agy_events(os.path.join(d, "log"))) if model == "agy" else None
-    if res and res.get("status") != "SUCCESS":
+    if res and (res.get("status") != "SUCCESS" or res.get("error") or res.get("finished_reason")):
         parts.append(json.dumps({k: res.get(k) for k in ("status", "error", "finished_reason")})[:2000])
     for e in events(os.path.join(d, "log")):
         if (e.get("type") == "error" or e.get("is_error")
@@ -1545,7 +1636,7 @@ def usage_figures(model, d):
     except Exception:
         rows = []
     fig = {k: total(r[k] for r in rows) if rows else None for k in ("input", "cached", "output", "reasoning", "usd")}
-    fig["billing"] = BILLING[model]
+    fig["billing"] = rows[0]["billing"] if model == "agy" and rows else BILLING[model]
     fig["quota_pct"] = next((r["quota_pct"] for r in rows if r.get("quota_pct") is not None), None)
     return fig
 
@@ -1609,8 +1700,8 @@ def last_step(model, d):
             return " ".join(str(x) for x in ("result", r.get("status"), r.get("finished_reason")) if x)
         s = e.get("step_update") if isinstance(e.get("step_update"), dict) else {}
         if s.get("step_type") == "tool":
-            return ("tool %s %s" % (s.get("tool_name") or "", "" if s.get("state") in ("ACTIVE", "DONE")
-                                    else s.get("state") or "")).strip()
+            # always the state: a DONE tool step may still have been refused (see NOTES.md)
+            return ("tool %s %s" % (s.get("tool_name") or "", s.get("state") or "")).strip()
         return str(s.get("step_type") or e.get("event"))
     ev = events(os.path.join(d, "log"))
     if not ev:
@@ -1729,7 +1820,7 @@ def ask_judge(d, n, conversation):
     log = os.path.join(d, "home", "agy-ask-%d.log" % n)
     text, problem = agy_final(d, os.path.join(d, "ask-%d.log" % n), log)
     problems = [problem] if problem else []
-    if not os.path.exists(log):                          # agy_final skips a missing log; here it must exist
+    if not os.path.isdir(os.path.join(d, "home")):       # agy_final skips a cleaned home; here the log must exist
         problems.append("agy's log of this run is missing, so the guard cannot be shown loaded")
     got = (agy_result(agy_events(os.path.join(d, "ask-%d.log" % n))) or {}).get("conversation_id")
     if got != conversation:
@@ -1803,7 +1894,12 @@ def ask_run(argv, d, env, n, m):
                                 os.kill(p, want)
                             except OSError:
                                 pass
-        return "policy-error" if flags["policy_error"] else "stopped" if flags["stop"] else str(code)
+        result = "policy-error" if flags["policy_error"] else "stopped" if flags["stop"] else str(code)
+        bad = agy_guard_unshown(d, guard_log) if result == "0" else ""
+        if bad:                                          # the verdict on the guard, once more
+            sys.stderr.write("[poll] %s: %s; the result is policy-error\n" % (m, bad))
+            result = "policy-error"
+        return result
     finally:
         if proc:                                         # whatever is left, also after an error above
             if proc.poll() is None:
@@ -1860,6 +1956,9 @@ def cmd_ask(a):
     argv += ["--conversation", conversation]
     env = child_env("agy", d, m in meta.get("own_data", []))
     env["TMPDIR"] = os.path.join(d, "tmp") + os.sep
+    bad = agy_preflight(d, env)
+    if bad:
+        die("%s: %s; the question was not sent" % (m, bad), 95)
     sys.stderr.write("[poll] asking %s (follow-up %d); output in %s\n" % (m, n, os.path.join(d, "ask-%d.log" % n)))
     result = ask_run(argv, d, env, n, m)
     text, problem = ask_judge(d, n, conversation)
@@ -2055,15 +2154,16 @@ def usage_agy(d):
         us = [u] if isinstance(u, dict) else []
     note = "input excludes cached tokens (inferred, not documented); reasoning is part of output"
     log = read(os.path.join(d, "home", AGY_LOG))
+    billing, signed = BILLING["agy"], ""
     if "authenticated via gemini_api_key" in log:
-        note += "; this run was billed to an API key, not the plan"
+        billing, signed = "API key, per token (price not known here)", "; this run was billed to an API key, not the plan"
     elif "authenticated via keyring" in log:
-        note += "; signed in through the keychain (the account's plan)"
+        signed = "; signed in through the keychain (the account's plan)"
     if not us:
-        return [row("agy", billing="Google AI plan", note="no usage in the log")]
+        return [row("agy", billing=billing, note="no usage in the log" + signed)]
     return [row("agy", total(num(u.get("input_tokens")) for u in us), total(num(u.get("cache_read_tokens")) for u in us),
                 total(num(u.get("output_tokens")) for u in us), total(num(u.get("thinking_tokens")) for u in us),
-                None, "Google AI plan", note)]
+                None, billing, note + signed)]
 
 
 USAGE = {"codex": usage_codex, "deepseek": usage_deepseek, "grok": usage_grok, "gemini": usage_gemini,
