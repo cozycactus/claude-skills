@@ -149,7 +149,13 @@ AGY_FIXED = [".gemini", AGY_CONF, os.path.join(AGY_CONF, "hooks.json"), os.path.
 # With its key in the keychain DeepSeek needs nothing from opencode's real data folder:
 # its data, state and cache then live in <poll>/deepseek/home (see child_env).
 DEEPSEEK_ISOLATED_READ = [".config/opencode", ".opencode"]
-KEYCHAIN = {"deepseek": ("deepseek-api-key", "DEEPSEEK_API_KEY"), "gemini": ("gemini-api-key", "GEMINI_API_KEY")}
+# With a Cursor API key in the keychain Grok signs in from its environment: its home then has no link to
+# the keychain, the profile reads no keychain file and denies the security program, so a command the
+# model runs cannot read the user's other keychain items (see NOTES.md, "What cannot be closed").
+GROK_KEYED_READ = [".local/share/cursor-agent"]
+DENY_SECURITY = '(deny process-exec (literal "/usr/bin/security"))'
+KEYCHAIN = {"deepseek": ("deepseek-api-key", "DEEPSEEK_API_KEY"), "gemini": ("gemini-api-key", "GEMINI_API_KEY"),
+            "grok": ("cursor-api-key", "CURSOR_API_KEY")}
 TOOL_DIRS = [".local/bin", ".local/share/uv", ".local/opt", ".hermes/node", ".cargo/bin",
              ".rustup/toolchains", ".bun/bin"]
 
@@ -199,11 +205,16 @@ RULES ADDED BY THE POLL RUNNER
 ACCESS_DEEPSEEK_ISOLATED = ("macOS sandbox with data folders of its own (key taken from the keychain): writes only its copy, "
                             "those and its temp folder; under /Users and the temp areas reads only these, opencode's "
                             "program and config, and tool folders; runs commands; network open; its API key in its environment.")
+ACCESS_GROK_KEYED = ("macOS sandbox with a home folder of its own, signed in by a Cursor API key taken from the keychain: "
+                     "writes only that home and its temp folder (not its copy); under /Users and the temp areas reads "
+                     "only its copy, the cursor-agent program and tool folders; no keychain file and no security program, "
+                     "so it cannot read the user's other keychain items; the Cursor key is in its environment; it can "
+                     "still start processes; network open.")
 ACCESS = {
     ("codex", False): "Codex sandbox, read-only: no writes, its commands have no network. It can READ the whole disk, other reviewers' folders included. User config, MCP and plugins not loaded.",
     ("codex", True): "Codex sandbox, workspace-write: writes only its copy and its own temp folder, commands have no network. It can READ the whole disk, other reviewers' folders included.",
     ("deepseek", False): "macOS sandbox: writes only its copy, its temp folder and opencode's real data folders, which also hold the user's earlier opencode sessions (it can read and change those); under /Users and the temp areas reads only these plus tool folders; runs commands; network open.",
-    ("grok", False): "macOS sandbox with a home folder of its own: writes only that and its temp folder (not its copy); under /Users and the temp areas reads only its copy, the cursor-agent program, tool folders and the encrypted login keychain file (needed for sign-in); it can still start processes; network open.",
+    ("grok", False): "macOS sandbox with a home folder of its own: writes only that and its temp folder (not its copy); under /Users and the temp areas reads only its copy, the cursor-agent program, tool folders and the encrypted login keychain file (needed for sign-in); a command it runs could read the user's keychain items through /usr/bin/security; it can still start processes; network open.",
     ("gemini", False): "Gemini CLI sandbox, plan mode, allow-list policy: read tools and web search only; reads its copy, ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
     ("gemini", True): "Gemini CLI sandbox, auto-approved tools: writes and runs commands in its copy; reads ~/.config and all of /private (the coordinator's scratchpad included); network open; its API key in its environment.",
     ("agy", False): "macOS sandbox with a home folder of its own; a guard hook lets the model only read files inside its copy and search the web (the search runs on Google's side), and agy's rules also deny writes, commands, URL fetches and MCP calls; the sandbox lets it write only that home and its temp folder (not its copy) and, under /Users and the temp areas, read only its copy, its own home, tool folders and the encrypted login keychain file (needed for its sign-in); network open; signed in with the user's Google account (plan quota, no API key); GEMINI.md, AGENTS.md and .agents/skills inside the copy are loaded as instructions; a command run inside this sandbox could read keychain items through /usr/bin/security, which is why commands are denied twice.",
@@ -513,15 +524,17 @@ def sb_regex(path):
     return re.sub(r'([.^$*+?()\[\]{}|\\"])', r"\\\1", path)
 
 
-def sandbox_profile(model, copy, tmp, home_dir=None):
+def sandbox_profile(model, copy, tmp, home_dir=None, keyed=False):
     q = lambda p: '"%s"' % p.replace("\\", "\\\\").replace('"', '\\"')
     home = lambda rels: [os.path.join(HOME, r) for r in rels]
     own = [tmp] + ([home_dir] if home_dir else [])
     isolated_ds = model == "deepseek" and home_dir is not None
+    keyed = keyed and model == "grok"                    # signed in by API key: no keychain at all
     writable = own + ["/dev"] + home([] if isolated_ds else WRITE_DIRS[model])
     if model == "deepseek":
         writable.insert(0, copy)
-    readable = [copy] + own + home(DEEPSEEK_ISOLATED_READ if isolated_ds else READ_DIRS[model]) + home(TOOL_DIRS)
+    rels = DEEPSEEK_ISOLATED_READ if isolated_ds else GROK_KEYED_READ if keyed else READ_DIRS[model]
+    readable = [copy] + own + home(rels) + home(TOOL_DIRS)
     lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
     lines += ["(allow file-write* (subpath %s))" % q(p) for p in writable]
     if model == "agy" and home_dir:                      # later rules win: no plain-text token in its home,
@@ -536,6 +549,8 @@ def sandbox_profile(model, copy, tmp, home_dir=None):
     above = sorted({a for p in readable for a in parents(p)})
     lines += ["(allow file-read-metadata (literal %s))" % q(p) for p in above]
     lines += ["(allow file-read* (subpath %s))" % q(p) for p in readable]
+    if keyed:                                            # a second layer: the keychain file is unreadable anyway
+        lines.append(DENY_SECURITY)
     return "\n".join(lines) + "\n"
 
 
@@ -637,6 +652,7 @@ def cmd_new(a):
     else:
         die("could not create a poll folder")
     deepseek_isolated = "deepseek" in providers and keychain_has(KEYCHAIN["deepseek"][0])
+    grok_keyed = "grok" in providers and keychain_has(KEYCHAIN["grok"][0])
     try:
         master = os.path.join(root, "_src")
         rep = make_copy(a.src, master, a.force_large, a.attach or [])
@@ -649,7 +665,7 @@ def cmd_new(a):
             f.write("\n# not copied: submodules or nested repositories (%d)\n%s\n" % (len(rep["nested"]), "\n".join(rep["nested"])))
             f.write("\n# skipped standard folders, plain copies only (%d)\n%s\n" % (len(rep["skipped"]), "\n".join(rep["skipped"])))
             f.write("\n# notes\n%s\n" % "\n".join(rep["notes"]))
-        own_data, slot_notes = [], []
+        own_data, keyed, slot_notes = [], [], []
         for m in models:
             d = os.path.join(root, m)
             p = info[m]["provider"]
@@ -662,7 +678,11 @@ def cmd_new(a):
                 footer = FOOTER_RUN if can_run else (FOOTER_CODEX_RO if p == "codex" else FOOTER_RO)
                 f.write(brief.rstrip("\n") + "\n" + FOOTER_COMMON + footer + (FOOTER_AGY if p == "agy" else ""))
             home_dir = None
-            if p in PRIVATE_HOME:                        # a home of its own, with only the keychain linked in
+            if p == "grok" and grok_keyed:               # signed in by key: a home with nothing of the user's
+                home_dir = os.path.join(d, "home")
+                os.makedirs(home_dir)
+                keyed.append(m)
+            elif p in PRIVATE_HOME:                      # a home of its own, with only the keychain linked in
                 home_dir = os.path.join(d, "home")
                 os.makedirs(os.path.join(home_dir, "Library"))
                 os.symlink(os.path.join(HOME, "Library", "Keychains"),
@@ -676,13 +696,13 @@ def cmd_new(a):
                 own_data.append(m)
             if p in WRITE_DIRS:
                 with open(os.path.join(d, "profile.sb"), "w") as f:
-                    f.write(sandbox_profile(p, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir))
+                    f.write(sandbox_profile(p, os.path.join(d, "copy"), os.path.join(d, "tmp"), home_dir, m in keyed))
         shutil.rmtree(master)
         if slot_notes:                                   # what was changed in a slot's own copy
             with open(os.path.join(root, "manifest.txt"), "a", encoding="utf-8", errors="surrogateescape") as f:
                 f.write("\n# notes on the slots' copies\n%s\n" % "\n".join(slot_notes))
         meta = {"id": pid, "src": os.path.realpath(a.src), "models": models, "run": sorted(run),
-                "own_data": sorted(own_data), "slots": info, "kind": a.kind,
+                "own_data": sorted(own_data), "keyed": sorted(keyed), "slots": info, "kind": a.kind,
                 # how much there was to review, for the statistics
                 "size": {"files": rep["files"], "bytes": rep["bytes"], "brief_chars": len(brief)},
                 "copy": {k: rep[k] for k in ("mode", "files", "bytes", "notes")}}
@@ -716,15 +736,19 @@ def cmd_new(a):
     print("\nWhat each model can do:")
     for m in models:
         p = info[m]["provider"]
-        text = ACCESS_DEEPSEEK_ISOLATED if p == "deepseek" and deepseek_isolated else ACCESS[(p, m in run)]
+        text = (ACCESS_DEEPSEEK_ISOLATED if p == "deepseek" and deepseek_isolated
+                else ACCESS_GROK_KEYED if m in keyed else ACCESS[(p, m in run)])
         print("  %-*s %s" % (width, m, text))
     if "deepseek" in providers and not deepseek_isolated:
         print("note: no keychain item %r, so DeepSeek shares opencode's real data folder" % KEYCHAIN["deepseek"][0])
+    if "grok" in providers and not grok_keyed:
+        print("note: no keychain item %r, so Grok signs in through the login keychain, and a command it runs "
+              "could read the user's other keychain items" % KEYCHAIN["grok"][0])
 
 
 # ---------------------------------------------------------------- launch
 
-def child_env(model, d=None, own_data=False):
+def child_env(model, d=None, own_data=False, keyed=False):
     env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH", "LANG") if os.environ.get(k)}
     env.setdefault("LOGNAME", env.get("USER", ""))
     env.setdefault("LANG", "en_US.UTF-8")
@@ -751,6 +775,14 @@ def child_env(model, d=None, own_data=False):
         # (denied) once that path passes 83 characters; a path relative to its working
         # directory, the copy, keeps it in the private home however long the poll path is
         env["CURSOR_DATA_DIR"] = os.path.join(os.pardir, "home", ".cursor")
+        if keyed:                                        # its home has no keychain: sign in from the environment
+            key = keychain_value(KEYCHAIN["grok"][0])
+            if not key:
+                die("the keychain item %r is gone or unreadable; make a new poll" % KEYCHAIN["grok"][0], 96)
+            env[KEYCHAIN["grok"][1]] = key
+            # keep what it learns about the sign-in in memory: the file store would write it into the home,
+            # where the model can read it
+            env["AGENT_CLI_CREDENTIAL_STORE"] = "memory"
     if model == "agy":
         env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"       # only the word true works; "1" does not
     if model == "gemini":
@@ -970,7 +1002,7 @@ def cmd_launch(a):
         die("%s was already launched in this poll; make a new poll to try again" % m, 94)
     me = {"launcher": os.getpid(), "launcher_born": born(os.getpid()), "started": int(time.time())}
     write_json(os.path.join(d, "pid"), me)               # visible before the model exists
-    env = child_env(p, d, m in meta.get("own_data", []))
+    env = child_env(p, d, m in meta.get("own_data", []), m in meta.get("keyed", []))
     if p == "gemini":                                    # its own sandbox is built around the system temp folder
         env["TMPDIR"] = os.environ.get("TMPDIR") or tempfile.gettempdir()
     else:
